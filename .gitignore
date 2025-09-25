@@ -1,5 +1,5 @@
-*.venv*
-*code_testing.py
-*pycache*
-*.DS_Store*
+.venv*
+code_testing.py
+**/*pycache*
+**/.DS_Store
 Data/
