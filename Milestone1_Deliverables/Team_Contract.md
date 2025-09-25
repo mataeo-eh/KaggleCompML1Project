@@ -22,5 +22,5 @@ whatsoever then some sort of future third-party arbiter would necessarily need t
 *Signed:*
 
     Jeffrey Gregory
-    Mateo Anderson
+    Mataeo Anderson
     09/25/25
