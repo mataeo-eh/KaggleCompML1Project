@@ -169,10 +169,10 @@ from pathlib import Path
 from tqdm import tqdm
 
 def save_combined_mouse_sequences_uniform(
-    tracking_dir: str,
-    annotation_dir: str,
-    annotated_output: str,
-    unannotated_output: str,
+    tracking_dir,
+    annotation_dir, 
+    annotated_output, 
+    unannotated_output, 
     use_pyarrow: bool = True
 ):
     """
@@ -197,8 +197,7 @@ def save_combined_mouse_sequences_uniform(
 
     # Collect all possible columns first
     all_columns = set([
-        "video_id", "video_frame", "mouse_id",
-        "action", "agent_id", "target_id"
+        "video_frame", "mouse_id", "action", "agent_id", "target_id"
     ])
     bodyparts_seen = set()
 
@@ -222,7 +221,6 @@ def save_combined_mouse_sequences_uniform(
         tracking_df["action"] = None
         tracking_df["agent_id"] = None
         tracking_df["target_id"] = None
-        tracking_df["video_id"] = video_id
 
         # Apply annotations if available
         annot_file = annotation_map.get(track_file.name)
