@@ -1,4 +1,5 @@
 # Notebook copied from Amrosm on Kaggle from the publicly available code for the competition
+from __future__ import annotations
 '''
 # MABe Challenge - Social Action Recognition in Mice: Nearest neighbors
 
@@ -61,7 +62,9 @@ RUN_MODE = "dev"
 
 GLOBAL_CONFIG = {
     "verbose": True,
-    "device": "cpu",
+    # Auto-select GPU if available; otherwise, default to CPU.
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "stream_mode": "one",  # "one", "two", or "four"
     "save_model_dir": "models/",
     "load_model_dir": "models/",
     "window_sizes": [60, 90, 120],
@@ -104,6 +107,34 @@ def load_best_params_csv(path="tuning_results/best_params.csv"):
         return params
     except Exception as e:
         print(f"Warning: Could not read best_params.csv: {e}")
+        return None
+
+
+def get_best_params_path_for_stream(cfg: CTRGCNConfig) -> str:
+    """
+    Returns a stream-specific best_params CSV path, e.g.:
+        tuning_results/best_params_one.csv
+        tuning_results/best_params_two.csv
+        tuning_results/best_params_four.csv
+    """
+    os.makedirs("tuning_results", exist_ok=True)
+    mode = getattr(cfg, "stream_mode", "one")
+    assert mode in {"one", "two", "four"}, f"Unsupported stream_mode: {mode}"
+    return os.path.join("tuning_results", f"best_params_{mode}.csv")
+
+
+def load_best_params_csv_for_config(config: CTRGCNConfig) -> dict | None:
+    """
+    Load best hyperparameters for a specific stream_mode config.
+    """
+    path = get_best_params_path_for_stream(config)
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_csv(path)
+        return df.to_dict(orient="records")[0]
+    except Exception as e:
+        print(f"Warning: Could not read {path}: {e}")
         return None
 
 
@@ -173,6 +204,21 @@ class CTRGCNConfig:
 
     in_channels_bone_delta_only : int
         Channels for bone-delta-only stream in four-stream mode.
+
+    window : int
+        Sliding window length for CTR-GCN inputs.
+    stride : int
+        Sliding window stride for CTR-GCN inputs.
+    base_channels : int
+        Base number of channels in CTR-GCN blocks.
+    num_blocks : int
+        Number of STBlocks in CTR-GCN.
+    dropout : float
+        Dropout rate for CTR-GCN blocks.
+    lr : float
+        Learning rate for CTR-GCN optimizer.
+    alpha_balance : float | None
+        Positive class weight for BCEWithLogitsLoss (pos_weight).
     """
 
     mode: str = "dev"
@@ -184,7 +230,7 @@ class CTRGCNConfig:
     two_stream: bool = False
     in_channels_coords: int = 2
     in_channels_delta: int = 2
-    in_channels_single_stream: int = 4
+    in_channels_single_stream: int = 8
     use_bone: bool = True
     use_bone_delta: bool = True
     stream_mode: str = "one"
@@ -194,6 +240,39 @@ class CTRGCNConfig:
     in_channels_delta_only: int = 2
     in_channels_bone_only: int = 2
     in_channels_bone_delta_only: int = 2
+    window: int = 90
+    stride: int = 30
+    base_channels: int = 64
+    num_blocks: int = 3
+    dropout: float = 0.1
+    lr: float = 1e-3
+    alpha_balance: float | None = None
+
+
+def get_stream_mode_tag(cfg: CTRGCNConfig) -> str:
+    """
+    Return a short tag for the current stream_mode, e.g. "one", "two", "four".
+    """
+    mode = getattr(cfg, "stream_mode", "one")
+    assert mode in {"one", "two", "four"}, f"Unsupported stream_mode: {mode}"
+    return mode
+
+
+def get_stream_model_dir(cfg: CTRGCNConfig) -> str:
+    """
+    Return the directory where weights for this stream_mode should be stored.
+    Uses a shared root directory and per-stream subfolders.
+    """
+    root = "CTR-GCN-Models"
+    tag = get_stream_mode_tag(cfg)
+    sub = {
+        "one": "one_stream",
+        "two": "two_stream",
+        "four": "four_stream",
+    }[tag]
+    path = os.path.join(root, sub)
+    os.makedirs(path, exist_ok=True)
+    return path
 
 # Functions requiring updates for stream_mode and bone features:
 # - prepare_ctr_gcn_input
@@ -267,21 +346,18 @@ def get_ordered_joints_and_adjacency(body_parts_tracked):
     return ordered_joints, adjacency
 
 # ------------------------------------------------------------
-# CTR-GCN: Sliding window extraction (window=90, stride=30)
+# CTR-GCN: Sliding window extraction (parameterized)
 # ------------------------------------------------------------
-def create_sliding_windows_90_30(single_mouse_df):
+def create_sliding_windows(single_mouse_df, window: int, stride: int):
     """
     Takes a continuous single-mouse coordinate DataFrame and yields
-    windows of length 90 with stride 30, preserving frame indices.
+    windows of length `window` with stride `stride`, preserving frame indices.
     """
-    WINDOW = 90
-    STRIDE = 30
-
     n_frames = len(single_mouse_df)
     frames = single_mouse_df.index.to_numpy()
 
-    for start in range(0, n_frames - WINDOW + 1, STRIDE):
-        end = start + WINDOW
+    for start in range(0, n_frames - window + 1, stride):
+        end = start + window
         window_df = single_mouse_df.iloc[start:end]
         frame_indices = frames[start:end]
         yield window_df, frame_indices
@@ -293,7 +369,7 @@ def create_sliding_windows_90_30(single_mouse_df):
 def prepare_ctr_gcn_input(single_mouse_df, ordered_joints, config: CTRGCNConfig | None = None):
     """
     Convert a sliding-windowed single-mouse DataFrame into
-    CTR-GCN input tensors of shape (N, 2, V, 90).
+    CTR-GCN input tensors of shape (N, 8, V, T) where T == config.window.
 
     Parameters
     ----------
@@ -306,42 +382,52 @@ def prepare_ctr_gcn_input(single_mouse_df, ordered_joints, config: CTRGCNConfig 
 
     Returns
     -------
-    tensors : torch.Tensor of shape (N, 2, V, 90)
+    tensors/streams : depends on stream_mode
+        - "one": torch.Tensor of shape (N, C, V, T)
+        - "two": (list[Tensor], list[Tensor])
+        - "four": (list[Tensor], list[Tensor], list[Tensor], list[Tensor])
     frame_ranges : list of np.ndarray
         Each element is the frame indices for that window.
 
     Note
     ----
     The optional config.max_windows limit is useful for dev/testing to cap work.
-    The optional config.use_delta/config.two_stream settings enable velocity and two-stream output for dev/validate/submit.
+    This helper always returns tensors aligned with stream_mode:
+    - "one": coords+delta+bone+bone_delta merged (default 8 channels)
+    - "two": streamA = coords+bone (default 4), streamB = delta+bone_delta (default 4)
+    - "four": coords, delta, bone, bone_delta (default 2 channels each)
     """
-    mode = "one"
-    if config is not None:
-        mode = config.stream_mode if hasattr(config, "stream_mode") else "one"
-        if getattr(config, "two_stream", False) and mode == "one":
-            mode = "two"
+    if config is None:
+        config = CTRGCNConfig()
+
+    mode = getattr(config, "stream_mode", "one")
+    window_len = getattr(config, "window", 90)
+    stride = getattr(config, "stride", 30)
+
     V = len(ordered_joints)
     frame_ranges = []
     window_count = 0
-    if config is None or mode == "one":
-        window_tensors = []
+    if mode == "one":
+        window_tensors: list[torch.Tensor] = []
     elif mode == "two":
-        streamA_tensors = []
-        streamB_tensors = []
-    else:  # four
-        coords_tensors = []
-        delta_tensors = []
-        bone_tensors = []
-        bone_delta_tensors = []
+        streamA_tensors: list[torch.Tensor] = []
+        streamB_tensors: list[torch.Tensor] = []
+    elif mode == "four":
+        coords_tensors: list[torch.Tensor] = []
+        delta_tensors: list[torch.Tensor] = []
+        bone_tensors: list[torch.Tensor] = []
+        bone_delta_tensors: list[torch.Tensor] = []
+    else:
+        raise ValueError(f"Unsupported stream_mode: {mode}")
 
-    for window_df, frame_indices in create_sliding_windows_90_30(single_mouse_df):
-        if config is not None and config.max_windows is not None and window_count >= config.max_windows:
+    for window_df, frame_indices in create_sliding_windows(single_mouse_df, window_len, stride):
+        if config.max_windows is not None and window_count >= config.max_windows:
             break
-        if len(window_df) != 90:
+        if len(window_df) != window_len:
             # Skip incomplete windows to keep tensor shape consistent.
             continue
 
-        window_np = np.full((2, V, 90), np.nan, dtype=np.float32)
+        window_np = np.full((2, V, window_len), np.nan, dtype=np.float32)
         for j, bp in enumerate(ordered_joints):
             try:
                 coords = window_df[bp]
@@ -350,12 +436,6 @@ def prepare_ctr_gcn_input(single_mouse_df, ordered_joints, config: CTRGCNConfig 
             except KeyError:
                 # Missing bodypart columns remain NaN.
                 continue
-
-        if config is None:
-            window_tensors.append(torch.from_numpy(window_np))
-            frame_ranges.append(frame_indices)
-            window_count += 1
-            continue
 
         # Compute bone vectors (pad last with zeros)
         bone = np.zeros_like(window_np)
@@ -420,14 +500,260 @@ def prepare_ctr_gcn_input(single_mouse_df, ordered_joints, config: CTRGCNConfig 
         frame_ranges.append(frame_indices)
         window_count += 1
 
-    if config is None or mode == "one":
+    if mode == "one":
         if len(window_tensors) == 0:
-            channels = 2 if config is None else config.in_channels_single_stream
-            return torch.empty((0, channels, V, 90)), frame_ranges
+            return torch.empty((0, config.in_channels_single_stream, V, window_len)), frame_ranges
         return torch.stack(window_tensors, dim=0), frame_ranges
     if mode == "two":
         return streamA_tensors, streamB_tensors, frame_ranges
+    # mode == "four"
     return coords_tensors, delta_tensors, bone_tensors, bone_delta_tensors, frame_ranges
+
+
+def collect_ctr_gcn_windows(
+    batches,
+    ordered_joints,
+    config: CTRGCNConfig,
+):
+    """
+    Collect CTR-GCN windows and labels for all actions across batches.
+    Returns per-stream windows and a dict mapping actions to label lists.
+    """
+    mode = getattr(config, "stream_mode", "one")
+    window_len = getattr(config, "window", 90)
+
+    X_windows: list[torch.Tensor] = []
+    streamA_windows: list[torch.Tensor] = []
+    streamB_windows: list[torch.Tensor] = []
+    coords_windows: list[torch.Tensor] = []
+    delta_windows: list[torch.Tensor] = []
+    bone_windows: list[torch.Tensor] = []
+    bone_delta_windows: list[torch.Tensor] = []
+    y_dict: dict[str, list] = {}
+
+    batch_count = 0
+    iterable = batches
+    if RUN_MODE != "submit":
+        iterable = tqdm(batches, desc="Processing batches")
+
+    for data_df, meta_df, label_df in iterable:
+        if config.max_batches is not None and batch_count >= config.max_batches:
+            break
+
+        if mode == "one":
+            window_tensor, frame_ranges = prepare_ctr_gcn_input(data_df, ordered_joints, config)
+            if window_tensor.shape[0] == 0:
+                batch_count += 1
+                continue
+        elif mode == "two":
+            streamA_list, streamB_list, frame_ranges = prepare_ctr_gcn_input(data_df, ordered_joints, config)
+            if len(streamA_list) == 0:
+                batch_count += 1
+                continue
+        else:  # four
+            coords_list, delta_list, bone_list, bone_delta_list, frame_ranges = prepare_ctr_gcn_input(data_df, ordered_joints, config)
+            if len(coords_list) == 0:
+                batch_count += 1
+                continue
+
+        # Ensure label tracking per action
+        for action in label_df.columns:
+            if action not in y_dict:
+                y_dict[action] = []
+
+        fr_iter = frame_ranges
+        if RUN_MODE != "submit":
+            fr_iter = tqdm(frame_ranges, desc="Assigning labels to windows")
+        for i, frame_range in enumerate(fr_iter):
+            center_frame = frame_range[len(frame_range) // 2]
+            if center_frame not in label_df.index:
+                continue
+            label_row = label_df.loc[center_frame]
+            if mode == "one":
+                X_windows.append(window_tensor[i])
+            elif mode == "two":
+                streamA_windows.append(streamA_list[i])
+                streamB_windows.append(streamB_list[i])
+            else:
+                coords_windows.append(coords_list[i])
+                delta_windows.append(delta_list[i])
+                bone_windows.append(bone_list[i])
+                bone_delta_windows.append(bone_delta_list[i])
+            for action in y_dict.keys():
+                val = label_row[action] if action in label_row else np.nan
+                y_dict[action].append(val)
+
+        batch_count += 1
+
+    if mode == "one":
+        if len(X_windows) == 0:
+            empty_tensor = torch.empty((0, config.in_channels_single_stream, len(ordered_joints), window_len))
+            return ("one", empty_tensor), {}
+        return ("one", torch.stack(X_windows, dim=0)), y_dict
+    if mode == "two":
+        if len(streamA_windows) == 0:
+            return ("two", ([], [])), {}
+        return ("two", (streamA_windows, streamB_windows)), y_dict
+    # four
+    if len(coords_windows) == 0:
+        return ("four", ([], [], [], [])), {}
+    return ("four", (coords_windows, delta_windows, bone_windows, bone_delta_windows)), y_dict
+
+
+def compute_validation_f1_from_windows(
+    streams_tuple,
+    y_dict: dict[str, list],
+    adjacency: np.ndarray,
+    config: CTRGCNConfig,
+    device: str,
+    seed: int = 0,
+) -> float:
+    """
+    Train/val split on collected windows and compute mean F1 across actions.
+    streams_tuple = (mode, data) where data matches stream_mode.
+    """
+    mode, data = streams_tuple
+    # Check empties
+    if mode == "one" and data.shape[0] == 0:
+        return 0.0
+    if mode in ("two", "four"):
+        if not data or (isinstance(data, tuple) and len(data[0]) == 0):
+            return 0.0
+
+    # Move data once
+    if mode == "one":
+        X = data.to(device)
+    elif mode == "two":
+        X_streamA = torch.stack(data[0], dim=0).to(device)
+        X_streamB = torch.stack(data[1], dim=0).to(device)
+    else:  # four
+        X_coords = torch.stack(data[0], dim=0).to(device)
+        X_delta = torch.stack(data[1], dim=0).to(device)
+        X_bone = torch.stack(data[2], dim=0).to(device)
+        X_bone_delta = torch.stack(data[3], dim=0).to(device)
+
+    base_channels = getattr(config, "base_channels", 64)
+    num_blocks = getattr(config, "num_blocks", 3)
+    dropout = getattr(config, "dropout", 0.1)
+    lr = getattr(config, "lr", 1e-3)
+    alpha_balance = getattr(config, "alpha_balance", None)
+
+    # Epochs aligned with train_ctr_gcn_models logic
+    if config.mode == "dev":
+        epochs = 1
+    elif config.mode == "validate":
+        epochs = 3
+    else:
+        epochs = 5
+
+    f1_scores: list[float] = []
+    rng = np.random.default_rng(seed)
+
+    for action, labels in y_dict.items():
+        y_tensor = torch.tensor(labels, dtype=torch.float32, device=device)
+        mask = ~torch.isnan(y_tensor)
+        if mask.sum().item() < 2:
+            continue
+        y_action = y_tensor[mask].unsqueeze(1)
+
+        if mode == "one":
+            X_action = X[mask]
+        elif mode == "two":
+            X_action_A = X_streamA[mask]
+            X_action_B = X_streamB[mask]
+        else:
+            X_action_coords = X_coords[mask]
+            X_action_delta = X_delta[mask]
+            X_action_bone = X_bone[mask]
+            X_action_bone_delta = X_bone_delta[mask]
+
+        n_samples = y_action.shape[0]
+        perm = rng.permutation(n_samples)
+        split_idx = max(1, int(0.8 * n_samples))
+        if split_idx >= n_samples:
+            split_idx = n_samples - 1
+        train_idx = perm[:split_idx]
+        val_idx = perm[split_idx:]
+
+        if mode == "one":
+            model = CTRGCNMinimal(
+                in_channels=config.in_channels_single_stream,
+                num_classes=1,
+                adjacency=adjacency,
+                base_channels=base_channels,
+                num_blocks=num_blocks,
+                dropout=dropout,
+            ).to(device)
+        elif mode == "two":
+            model = CTRGCNTwoStream(
+                adjacency=adjacency,
+                in_channels_coords=config.in_channels_streamA,
+                in_channels_delta=config.in_channels_streamB,
+                base_channels=base_channels,
+                num_blocks=num_blocks,
+                dropout=dropout,
+            ).to(device)
+        else:
+            model = CTRGCNFourStream(
+                adjacency=adjacency,
+                base_channels=base_channels,
+                dropout=dropout,
+                num_blocks=num_blocks,
+            ).to(device)
+
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        if alpha_balance is not None:
+            pos_weight = torch.tensor([alpha_balance], device=device)
+            criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        else:
+            criterion = torch.nn.BCEWithLogitsLoss()
+
+        for _ in range(epochs):
+            model.train()
+            for start in range(0, len(train_idx), 16):
+                end = start + 16
+                batch_ids = train_idx[start:end]
+                batch_y = y_action[batch_ids]
+                if mode == "one":
+                    batch_x = X_action[batch_ids]
+                    logits = model(batch_x)
+                elif mode == "two":
+                    batch_x_A = X_action_A[batch_ids]
+                    batch_x_B = X_action_B[batch_ids]
+                    logits = model(batch_x_A, batch_x_B)
+                else:
+                    batch_x_coords = X_action_coords[batch_ids]
+                    batch_x_delta = X_action_delta[batch_ids]
+                    batch_x_bone = X_action_bone[batch_ids]
+                    batch_x_bone_delta = X_action_bone_delta[batch_ids]
+                    logits = model(batch_x_coords, batch_x_delta, batch_x_bone, batch_x_bone_delta)
+                optimizer.zero_grad()
+                loss = criterion(logits, batch_y)
+                loss.backward()
+                optimizer.step()
+
+        model.eval()
+        with torch.no_grad():
+            if mode == "one":
+                logits_val = model(X_action[val_idx])
+            elif mode == "two":
+                logits_val = model(X_action_A[val_idx], X_action_B[val_idx])
+            else:
+                logits_val = model(
+                    X_action_coords[val_idx],
+                    X_action_delta[val_idx],
+                    X_action_bone[val_idx],
+                    X_action_bone_delta[val_idx],
+                )
+            probs = torch.sigmoid(logits_val).cpu().numpy().reshape(-1)
+        y_val = y_action[val_idx].cpu().numpy().reshape(-1)
+        preds = (probs > 0.5).astype(int)
+        f1 = f1_score(y_val, preds, zero_division=0)
+        f1_scores.append(f1)
+
+    if len(f1_scores) == 0:
+        return 0.0
+    return float(sum(f1_scores) / len(f1_scores))
 
 
 # ------------------------------------------------------------
@@ -730,79 +1056,13 @@ def train_ctr_gcn_models(
         A dictionary mapping action → trained CTR-GCN model.
     """
     model_dict: dict[str, CTRGCNMinimal] = {}
-    y_dict: dict[str, list] = {}
-    mode = config.stream_mode if hasattr(config, "stream_mode") else "one"
-    if getattr(config, "two_stream", False) and mode == "one":
-        mode = "two"
-    if mode == "one":
-        X_windows: list[torch.Tensor] = []
-    elif mode == "two":
-        streamA_windows: list[torch.Tensor] = []
-        streamB_windows: list[torch.Tensor] = []
-    else:
-        coords_windows: list[torch.Tensor] = []
-        delta_windows: list[torch.Tensor] = []
-        bone_windows: list[torch.Tensor] = []
-        bone_delta_windows: list[torch.Tensor] = []
 
-    batch_count = 0
-    iterable = batches
-    if RUN_MODE != "submit":
-        iterable = tqdm(batches, desc="Processing batches")
-    for data_df, meta_df, label_df in iterable:
-        if config.max_batches is not None and batch_count >= config.max_batches:
-            break
+    streams_tuple, y_dict = collect_ctr_gcn_windows(batches, ordered_joints, config)
+    mode, data = streams_tuple
 
-        if mode == "one":
-            window_tensor, frame_ranges = prepare_ctr_gcn_input(data_df, ordered_joints, config)
-            if window_tensor.shape[0] == 0:
-                batch_count += 1
-                continue
-        elif mode == "two":
-            streamA_list, streamB_list, frame_ranges = prepare_ctr_gcn_input(data_df, ordered_joints, config)
-            if len(streamA_list) == 0:
-                batch_count += 1
-                continue
-        else:
-            coords_list, delta_list, bone_list, bone_delta_list, frame_ranges = prepare_ctr_gcn_input(data_df, ordered_joints, config)
-            if len(coords_list) == 0:
-                batch_count += 1
-                continue
-
-        # Ensure label tracking per action
-        for action in label_df.columns:
-            if action not in y_dict:
-                y_dict[action] = []
-
-        fr_iter = frame_ranges
-        if RUN_MODE != "submit":
-            fr_iter = tqdm(frame_ranges, desc="Assigning labels to windows")
-        for i, frame_range in enumerate(fr_iter):
-            center_frame = frame_range[len(frame_range) // 2]
-            if center_frame not in label_df.index:
-                continue
-            label_row = label_df.loc[center_frame]
-            if mode == "one":
-                X_windows.append(window_tensor[i])
-            elif mode == "two":
-                streamA_windows.append(streamA_list[i])
-                streamB_windows.append(streamB_list[i])
-            else:
-                coords_windows.append(coords_list[i])
-                delta_windows.append(delta_list[i])
-                bone_windows.append(bone_list[i])
-                bone_delta_windows.append(bone_delta_list[i])
-            for action in y_dict.keys():
-                val = label_row[action] if action in label_row else np.nan
-                y_dict[action].append(val)
-
-        batch_count += 1
-
-    if mode == "one" and len(X_windows) == 0:
+    if mode == "one" and (data is None or data.shape[0] == 0):
         return model_dict
-    if mode == "two" and len(streamA_windows) == 0:
-        return model_dict
-    if mode == "four" and len(coords_windows) == 0:
+    if mode in ("two", "four") and (not data or (isinstance(data, tuple) and len(data[0]) == 0)):
         return model_dict
 
     batch_size = 16
@@ -814,18 +1074,21 @@ def train_ctr_gcn_models(
         epochs = 5
 
     if mode == "one":
-        X = torch.stack(X_windows, dim=0).to(device)
-        in_channels_single = X.shape[1]
+        X = data.to(device)
     elif mode == "two":
-        X_streamA = torch.stack(streamA_windows, dim=0).to(device)
-        X_streamB = torch.stack(streamB_windows, dim=0).to(device)
+        X_streamA = torch.stack(data[0], dim=0).to(device)
+        X_streamB = torch.stack(data[1], dim=0).to(device)
     else:
-        X_coords = torch.stack(coords_windows, dim=0).to(device)
-        X_delta = torch.stack(delta_windows, dim=0).to(device)
-        X_bone = torch.stack(bone_windows, dim=0).to(device)
-        X_bone_delta = torch.stack(bone_delta_windows, dim=0).to(device)
+        X_coords = torch.stack(data[0], dim=0).to(device)
+        X_delta = torch.stack(data[1], dim=0).to(device)
+        X_bone = torch.stack(data[2], dim=0).to(device)
+        X_bone_delta = torch.stack(data[3], dim=0).to(device)
 
-    batch_size = 16
+    base_channels = getattr(config, "base_channels", 64)
+    num_blocks = getattr(config, "num_blocks", 3)
+    dropout = getattr(config, "dropout", 0.1)
+    lr = getattr(config, "lr", 1e-3)
+    alpha_balance = getattr(config, "alpha_balance", None)
 
     for action, labels in y_dict.items():
         y_tensor = torch.tensor(labels, dtype=torch.float32, device=device)
@@ -836,24 +1099,43 @@ def train_ctr_gcn_models(
 
         if mode == "one":
             X_action = X[mask]
-            model = CTRGCNMinimal(in_channels=in_channels_single, num_classes=1, adjacency=adjacency).to(device)
+            model = CTRGCNMinimal(
+                in_channels=config.in_channels_single_stream,
+                num_classes=1,
+                adjacency=adjacency,
+                base_channels=base_channels,
+                num_blocks=num_blocks,
+                dropout=dropout,
+            ).to(device)
         elif mode == "two":
             X_action_A = X_streamA[mask]
             X_action_B = X_streamB[mask]
             model = CTRGCNTwoStream(
                 adjacency=adjacency,
-                in_channels_coords=X_action_A.shape[1],
-                in_channels_delta=X_action_B.shape[1],
+                in_channels_coords=config.in_channels_streamA,
+                in_channels_delta=config.in_channels_streamB,
+                base_channels=base_channels,
+                num_blocks=num_blocks,
+                dropout=dropout,
             ).to(device)
         else:
             X_action_coords = X_coords[mask]
             X_action_delta = X_delta[mask]
             X_action_bone = X_bone[mask]
             X_action_bone_delta = X_bone_delta[mask]
-            model = CTRGCNFourStream(adjacency=adjacency).to(device)
+            model = CTRGCNFourStream(
+                adjacency=adjacency,
+                base_channels=base_channels,
+                dropout=dropout,
+                num_blocks=num_blocks,
+            ).to(device)
 
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-        criterion = torch.nn.BCEWithLogitsLoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        if alpha_balance is not None:
+            pos_weight = torch.tensor([alpha_balance], device=device)
+            criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        else:
+            criterion = torch.nn.BCEWithLogitsLoss()
 
         for _ in range(epochs):
             model.train()
@@ -1596,7 +1878,7 @@ def cross_validate_classifier(binary_classifier, X, label, meta):
 
 
 def load_ctr_gcn_models(
-    model_dir: str,
+    model_dir: str | None,
     actions: list[str],
     adjacency: np.ndarray,
     config: CTRGCNConfig,
@@ -1607,8 +1889,8 @@ def load_ctr_gcn_models(
 
     Parameters
     ----------
-    model_dir : str
-        Directory containing "{action}.pt" weight files.
+    model_dir : str | None
+        Optional override directory; if None, derived from stream_mode.
     actions : list[str]
         Action names to load models for.
     adjacency : np.ndarray
@@ -1623,18 +1905,22 @@ def load_ctr_gcn_models(
     model_dict : dict[str, nn.Module]
         Loaded models, all in eval mode and moved to the correct device.
     """
-    # Auto-load best params for submission mode
-    best_params = load_best_params_csv()
+    model_dict: dict[str, nn.Module] = {}
+
+    # Auto-load best params for submission mode (stream-specific)
+    best_params = load_best_params_csv_for_config(config)
     if best_params is not None:
         for key, value in best_params.items():
             if hasattr(config, key):
                 setattr(config, key, value)
 
-    model_dict: dict[str, nn.Module] = {}
-
     mode = getattr(config, "stream_mode", "one")
-    if getattr(config, "two_stream", False) and mode == "one":
-        mode = "two"
+
+    base_channels = getattr(config, "base_channels", 64)
+    num_blocks = getattr(config, "num_blocks", 3)
+    dropout = getattr(config, "dropout", 0.1)
+
+    model_dir = get_stream_model_dir(config) if model_dir is None else model_dir
 
     for action in actions:
         if mode == "one":
@@ -1642,15 +1928,28 @@ def load_ctr_gcn_models(
                 in_channels=config.in_channels_single_stream,
                 num_classes=1,
                 adjacency=adjacency,
+                base_channels=base_channels,
+                num_blocks=num_blocks,
+                dropout=dropout,
             )
         elif mode == "two":
             model = CTRGCNTwoStream(
                 adjacency=adjacency,
                 in_channels_coords=config.in_channels_streamA,
                 in_channels_delta=config.in_channels_streamB,
+                base_channels=base_channels,
+                num_blocks=num_blocks,
+                dropout=dropout,
+            )
+        elif mode == "four":
+            model = CTRGCNFourStream(
+                adjacency=adjacency,
+                base_channels=base_channels,
+                dropout=dropout,
+                num_blocks=num_blocks,
             )
         else:
-            model = CTRGCNFourStream(adjacency=adjacency)
+            raise ValueError(f"Unsupported stream_mode: {mode}")
 
         weight_path = os.path.join(model_dir, f"{action}.pt")
         state = torch.load(weight_path, map_location=device)
@@ -1687,6 +1986,13 @@ def submit_ctr_gcn(
     device : str
         "cpu", "cuda", or "mps".
     """
+    # Apply stream-specific tuned parameters if available
+    best_params = load_best_params_csv_for_config(config)
+    if best_params is not None:
+        for key, value in best_params.items():
+            if hasattr(config, key):
+                setattr(config, key, value)
+
     body_parts_tracked = json.loads(body_parts_tracked_str)
 
     if validate_or_submit == "submit":
@@ -1715,8 +2021,6 @@ def submit_ctr_gcn(
     ordered_joints, adjacency = get_ordered_joints_and_adjacency(body_parts_tracked)
 
     mode = getattr(config, "stream_mode", "one")
-    if getattr(config, "two_stream", False) and mode == "one":
-        mode = "two"
 
     use_tqdm = (validate_or_submit in ["dev", "validate"]) and getattr(config, "show_progress", False)
     gen_iter = generator
@@ -2153,6 +2457,9 @@ if RUN_MODE == "tune":
     import csv
     import time
 
+    device = GLOBAL_CONFIG["device"]
+    stream_mode = GLOBAL_CONFIG.get("stream_mode", "one")
+
     # Create output directory
     os.makedirs("tuning_results", exist_ok=True)
 
@@ -2162,7 +2469,8 @@ if RUN_MODE == "tune":
     max_trials = GLOBAL_CONFIG["max_tuning_trials"]
     num_videos = GLOBAL_CONFIG["tuning_min_videos"]
 
-    results_path = "tuning_results/tuning_results.csv"
+    tag = stream_mode
+    results_path = os.path.join("tuning_results", f"tuning_results_{tag}.csv")
 
     # Prepare CSV log
     with open(results_path, "w", newline="") as f:
@@ -2191,6 +2499,7 @@ if RUN_MODE == "tune":
 
     best_f1 = -1
     best_params = None
+    best_model_dict: dict[str, nn.Module] | None = None
 
     for trial in range(1, max_trials + 1):
         print(f"\n=== Trial {trial}/{max_trials} ===")
@@ -2211,7 +2520,7 @@ if RUN_MODE == "tune":
             use_delta=True,
             use_bone=True,
             use_bone_delta=True,
-            stream_mode="one",
+            stream_mode=stream_mode,
         )
         cfg.window = window
         cfg.stride = stride
@@ -2220,6 +2529,8 @@ if RUN_MODE == "tune":
         cfg.dropout = dropout
         cfg.lr = lr
         cfg.alpha_balance = alpha_balance
+        cfg.max_batches = None
+        cfg.max_windows = None
 
         # Extract batches
         batches = []
@@ -2232,23 +2543,11 @@ if RUN_MODE == "tune":
         ):
             batches.append((data_df, meta_df, label_df))
 
-        # Train
-        model_dict = train_ctr_gcn_models(
-            batches,
-            ordered_joints,
-            adjacency,
-            cfg,
-            device=GLOBAL_CONFIG["device"]
+        # Collect windows + compute validation F1 across all actions
+        streams_tuple, y_dict = collect_ctr_gcn_windows(batches, ordered_joints, cfg)
+        mean_f1 = compute_validation_f1_from_windows(
+            streams_tuple, y_dict, adjacency, cfg, device=device, seed=trial
         )
-
-        # Compute validation F1 across all actions used
-        f1_scores = []
-        for action, model in model_dict.items():
-            # Only use BCE predictions directly for tuning
-            # (Skipping multiclass postprocessing here)
-            f1_scores.append(1.0)  # TODO: replace with true F1 once pipeline ready
-
-        mean_f1 = sum(f1_scores) / len(f1_scores) if f1_scores else 0.0
 
         # Write trial log
         with open(results_path, "a", newline="") as f:
@@ -2277,22 +2576,28 @@ if RUN_MODE == "tune":
                 "dropout": dropout,
                 "lr": lr,
                 "alpha_balance": alpha_balance,
+                "stream_mode": cfg.stream_mode,
             }
 
-            # Save model checkpoint
-            os.makedirs("models_tuned", exist_ok=True)
-            for action, model in model_dict.items():
-                torch.save(
-                    model.state_dict(),
-                    f"models_tuned/{action}.pt"
-                )
+            # Save model checkpoint (train on full collected batches)
+            model_dir = get_stream_model_dir(cfg)
+            best_model_dict = train_ctr_gcn_models(
+                batches,
+                ordered_joints,
+                adjacency,
+                cfg,
+                device=device,
+            )
+            for action, model in best_model_dict.items():
+                torch.save(model.state_dict(), os.path.join(model_dir, f"{action}.pt"))
 
     print("\n==== Hyperparameter Tuning Complete ====")
     os.makedirs("tuning_results", exist_ok=True)
-    best_path = "tuning_results/best_params.csv"
+    best_path = get_best_params_path_for_stream(cfg)
 
     import pandas as pd
-    pd.DataFrame([best_params]).to_csv(best_path, index=False)
+    if best_params is not None:
+        pd.DataFrame([best_params]).to_csv(best_path, index=False)
 
     print("Best F1:", best_f1)
     print("Best params saved to:", best_path)
@@ -2305,6 +2610,10 @@ if RUN_MODE == "tune_grid":
     print("Running CTR-GCN full grid search (tune_grid)...")
     print("WARNING: This mode is computationally intensive. Intended for HPC.")
     import itertools
+    import csv
+
+    device = GLOBAL_CONFIG["device"]
+    stream_mode = GLOBAL_CONFIG.get("stream_mode", "one")
 
     print("Preparing grid search...")
 
@@ -2331,6 +2640,24 @@ if RUN_MODE == "tune_grid":
     print(f"Total grid combinations: {len(grid)}")
 
     os.makedirs("grid_results", exist_ok=True)
+    tag = stream_mode
+    grid_results_path = os.path.join("grid_results", f"grid_results_{tag}.csv")
+    with open(grid_results_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "idx",
+            "window",
+            "stride",
+            "base_channels",
+            "num_blocks",
+            "dropout",
+            "lr",
+            "alpha_balance",
+            "mean_f1"
+        ])
+
+    best_f1 = -1.0
+    best_params = None
 
     for idx, combo in enumerate(grid, start=1):
         (
@@ -2351,7 +2678,7 @@ if RUN_MODE == "tune_grid":
             use_delta=True,
             use_bone=True,
             use_bone_delta=True,
-            stream_mode="one",
+            stream_mode=stream_mode,
         )
         cfg.window = window
         cfg.stride = stride
@@ -2360,8 +2687,10 @@ if RUN_MODE == "tune_grid":
         cfg.dropout = dropout
         cfg.lr = lr
         cfg.alpha_balance = alpha_balance
+        cfg.max_batches = None
+        cfg.max_windows = None
 
-        # Train on full dataset
+        # Train on full dataset (for saving checkpoints)
         batches = []
         for switch, data_df, meta_df, label_df in generate_mouse_data(
             train_subset,
@@ -2372,19 +2701,13 @@ if RUN_MODE == "tune_grid":
         ):
             batches.append((data_df, meta_df, label_df))
 
-        model_dict = train_ctr_gcn_models(
-            batches,
-            ordered_joints,
-            adjacency,
-            cfg,
-            device=GLOBAL_CONFIG["device"]
+        streams_tuple, y_dict = collect_ctr_gcn_windows(batches, ordered_joints, cfg)
+        mean_f1 = compute_validation_f1_from_windows(
+            streams_tuple, y_dict, adjacency, cfg, device=device, seed=idx
         )
 
-        # TODO: compute validation F1
-        mean_f1 = 1.0
-
         # Save results
-        with open("grid_results/grid_results.csv", "a", newline="") as f:
+        with open(grid_results_path, "a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
                 idx,
@@ -2398,31 +2721,57 @@ if RUN_MODE == "tune_grid":
                 mean_f1
             ])
 
+        if mean_f1 > best_f1:
+            best_f1 = mean_f1
+            best_params = {
+                "window": window,
+                "stride": stride,
+                "base_channels": base_channels,
+                "num_blocks": num_blocks,
+                "dropout": dropout,
+                "lr": lr,
+                "alpha_balance": alpha_balance,
+                "stream_mode": cfg.stream_mode,
+            }
+
+        model_dict = train_ctr_gcn_models(
+            batches,
+            ordered_joints,
+            adjacency,
+            cfg,
+            device=device,
+        )
+
         # Save model checkpoints for each action
+        model_dir = get_stream_model_dir(cfg)
         for action, model in model_dict.items():
             torch.save(
                 model.state_dict(),
-                f"grid_results/{action}_{idx}.pt"
+                os.path.join(model_dir, f"{action}_{idx}.pt")
             )
 
     print("\nGrid search completed.")
 
+    # Save best params found in grid search
+    if best_params is not None:
+        pd.DataFrame([best_params]).to_csv(os.path.join("grid_results", f"best_params_{tag}.csv"), index=False)
+        os.makedirs("tuning_results", exist_ok=True)
+        pd.DataFrame([best_params]).to_csv(get_best_params_path_for_stream(cfg), index=False)
+
 
 if RUN_MODE == "validate":
-    # Attempt to load best parameters from tuning
-    best_params = load_best_params_csv()
+    # Attempt to load best parameters from tuning for this stream
+    cfg = CTRGCNConfig(mode="validate", stream_mode=GLOBAL_CONFIG.get("stream_mode", "one"))
+    best_params = load_best_params_csv_for_config(cfg)
 
     if best_params is not None:
-        print("Using tuned hyperparameters:")
+        print("Using tuned hyperparameters for stream_mode =", cfg.stream_mode)
         print(best_params)
-
-        cfg = CTRGCNConfig(mode="validate")
         for key, value in best_params.items():
             if hasattr(cfg, key):
                 setattr(cfg, key, value)
     else:
-        print("No best_params.csv found. Using default CTRGCNConfig.")
-        cfg = CTRGCNConfig(mode="validate")
+        print(f"No best_params file found for stream_mode {cfg.stream_mode} - using defaults.")
     # Continue validation training with cfg
 
 
@@ -2459,3 +2808,161 @@ if validate_or_submit != 'validate':
     submission_robust.to_csv('submission.csv')
     df = pd.read_csv("submission.csv")
     print(df.head())
+
+# ============================================================
+# DEV-MODE SANITY CHECK
+# Runs a tiny end-to-end GCN pipeline test without real weights.
+# ============================================================
+
+if RUN_MODE == "dev":
+    print("\n========== DEV MODE SANITY CHECK ==========\n")
+
+    # Pick a device for the quick check (auto-select GPU if available, else CPU)
+    device = torch.device("cuda" if torch.cuda.is_available() else GLOBAL_CONFIG.get("device", "cpu"))
+    print(f"Using device for dev check: {device}")
+
+    # Pick a very small subset of train.csv
+    small_train = train_without_mabe22.sample(1, random_state=0)
+    print("Selected video:", small_train.video_id.values[0])
+
+    # Extract body-parts config
+    body_parts_tracked_str = small_train.body_parts_tracked.values[0]
+    body_parts_tracked = json.loads(body_parts_tracked_str)
+    print("Body parts for this dev test:", body_parts_tracked)
+
+    # Build joints + adjacency
+    ordered_joints, adjacency = get_ordered_joints_and_adjacency(body_parts_tracked)
+    print("Ordered joints:", ordered_joints)
+    print("Adjacency shape:", adjacency.shape)
+
+    # Set a small config to avoid heavy processing
+    dev_config = CTRGCNConfig(
+        mode="dev",
+        max_videos=1,
+        max_batches=2,
+        max_windows=3,
+        stream_mode=GLOBAL_CONFIG.get("stream_mode", "one"),
+        use_delta=True,
+        use_bone=True,
+        use_bone_delta=True,
+        window=90,
+        stride=30,
+    )
+    print(f"Dev window/stride: {dev_config.window}/{dev_config.stride}")
+
+    # Use generate_mouse_data to get a few single-mouse batches
+    generator = generate_mouse_data(
+        small_train,
+        traintest="train",
+        generate_single=True,
+        generate_pair=False,
+        config=dev_config
+    )
+
+    windows_collected = 0
+
+    for switch, data_df, meta_df, label_df in generator:
+        print(f"\nBatch type: {switch}")
+        print("Data shape:", data_df.shape)
+
+        # Build GCN inputs
+        mode = getattr(dev_config, "stream_mode", "one")
+        if mode == "one":
+            X, frame_ranges = prepare_ctr_gcn_input(data_df, ordered_joints, dev_config)
+            print("Window tensor shape:", X.shape)
+        elif mode == "two":
+            X_streamA, X_streamB, frame_ranges = prepare_ctr_gcn_input(data_df, ordered_joints, dev_config)
+            print("StreamA tensor count:", len(X_streamA))
+        else:
+            X_coords, X_delta, X_bone, X_bone_delta, frame_ranges = prepare_ctr_gcn_input(data_df, ordered_joints, dev_config)
+            print("Coord stream count:", len(X_coords))
+        print("Number of frame ranges:", len(frame_ranges))
+
+        # Pick a random action column to test
+        test_actions = list(label_df.columns)
+        if len(test_actions) == 0:
+            print("No actions labeled in this tiny batch, skipping.")
+            continue
+
+        action = test_actions[0]
+        print("Testing action:", action)
+
+        # Dummy untrained model
+        if mode == "one":
+            assert X.shape[1] == dev_config.in_channels_single_stream, f"Expected {dev_config.in_channels_single_stream} channels, got {X.shape[1]}"
+            dummy_model = CTRGCNMinimal(
+                in_channels=dev_config.in_channels_single_stream,
+                num_classes=1,
+                adjacency=adjacency
+            ).to(device)
+        elif mode == "two":
+            dummy_model = CTRGCNTwoStream(
+                adjacency=adjacency,
+                in_channels_coords=dev_config.in_channels_streamA,
+                in_channels_delta=dev_config.in_channels_streamB,
+                base_channels=dev_config.base_channels,
+                num_blocks=dev_config.num_blocks,
+                dropout=dev_config.dropout,
+            ).to(device)
+        else:
+            dummy_model = CTRGCNFourStream(
+                adjacency=adjacency,
+                base_channels=dev_config.base_channels,
+                dropout=dev_config.dropout,
+                num_blocks=dev_config.num_blocks,
+            ).to(device)
+
+        # Run forward pass
+        with torch.no_grad():
+            if mode == "one":
+                logits = dummy_model(X.to(device))
+            elif mode == "two":
+                logits = dummy_model(
+                    torch.stack(X_streamA, dim=0).to(device),
+                    torch.stack(X_streamB, dim=0).to(device),
+                )
+            else:
+                logits = dummy_model(
+                    torch.stack(X_coords, dim=0).to(device),
+                    torch.stack(X_delta, dim=0).to(device),
+                    torch.stack(X_bone, dim=0).to(device),
+                    torch.stack(X_bone_delta, dim=0).to(device),
+                )
+            probs = torch.sigmoid(logits).cpu().numpy().reshape(-1)
+
+        print("Logits:", logits[:5].cpu().numpy())
+        print("Probs:", probs[:5])
+
+        # Convert to per-frame predictions (window averaging)
+        frame_values = meta_df.video_frame.values
+        frame_to_idx = {f: i for i, f in enumerate(frame_values)}
+        pred_array = np.zeros((len(frame_values), 1), dtype=np.float32)
+        counts = np.zeros((len(frame_values), 1), dtype=np.float32)
+
+        for w_idx, frames in enumerate(frame_ranges):
+            p = float(probs[w_idx])
+            for f in frames:
+                fi = frame_to_idx.get(f)
+                if fi is None:
+                    continue
+                pred_array[fi, 0] += p
+                counts[fi, 0] += 1.0
+
+        counts[counts == 0] = 1
+        pred_array = pred_array / counts
+
+        # Build a mini prediction df for predict_multiclass
+        pred_df = pd.DataFrame(pred_array, index=frame_values, columns=[action])
+        submission_part = predict_multiclass(pred_df, meta_df)
+
+        print("\nGenerated mini submission_part:")
+        print(submission_part.head())
+
+        windows_collected += 1
+        if windows_collected >= 2:
+            break
+
+    print("\n========== DEV TEST COMPLETE ==========\n")
+
+else:
+    print("RUN_MODE is not 'dev'; skip quick sanity test.")
