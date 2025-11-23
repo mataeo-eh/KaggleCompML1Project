@@ -1527,6 +1527,233 @@ def cross_validate_classifier(binary_classifier, X, label, meta):
     submission_part = predict_multiclass(oof, meta)
     submission_list.append(submission_part) # type: ignore
 
+
+def load_ctr_gcn_models(
+    model_dir: str,
+    actions: list[str],
+    adjacency: np.ndarray,
+    config: CTRGCNConfig,
+    device: str = "cpu",
+) -> dict[str, nn.Module]:
+    """
+    Load trained CTR-GCN models from disk.
+
+    Parameters
+    ----------
+    model_dir : str
+        Directory containing "{action}.pt" weight files.
+    actions : list[str]
+        Action names to load models for.
+    adjacency : np.ndarray
+        Adjacency matrix (V,V) for the joints.
+    config : CTRGCNConfig
+        Configuration specifying stream_mode and channel sizes.
+    device : str
+        "cpu", "cuda", or "mps".
+
+    Returns
+    -------
+    model_dict : dict[str, nn.Module]
+        Loaded models, all in eval mode and moved to the correct device.
+    """
+    model_dict: dict[str, nn.Module] = {}
+
+    mode = getattr(config, "stream_mode", "one")
+    if getattr(config, "two_stream", False) and mode == "one":
+        mode = "two"
+
+    for action in actions:
+        if mode == "one":
+            model = CTRGCNMinimal(
+                in_channels=config.in_channels_single_stream,
+                num_classes=1,
+                adjacency=adjacency,
+            )
+        elif mode == "two":
+            model = CTRGCNTwoStream(
+                adjacency=adjacency,
+                in_channels_coords=config.in_channels_streamA,
+                in_channels_delta=config.in_channels_streamB,
+            )
+        else:
+            model = CTRGCNFourStream(adjacency=adjacency)
+
+        weight_path = os.path.join(model_dir, f"{action}.pt")
+        state = torch.load(weight_path, map_location=device)
+        model.load_state_dict(state)
+        model.to(device)
+        model.eval()
+        model_dict[action] = model
+
+    return model_dict
+
+
+def submit_ctr_gcn(
+    body_parts_tracked_str: str,
+    switch_tr: str,
+    model_dict: dict[str, nn.Module],
+    config: CTRGCNConfig,
+    device: str = "cpu",
+) -> None:
+    """
+    Generate submission parts using pre-trained CTR-GCN models
+    (inference-only, no training). Appends submission_part DataFrames
+    to the global submission_list, exactly like the LightGBM submit().
+
+    Parameters
+    ----------
+    body_parts_tracked_str : str
+        JSON list of body parts tracked.
+    switch_tr : str
+        "single" or "pair".
+    model_dict : dict[str, nn.Module]
+        Maps action → pretrained CTR-GCN model.
+    config : CTRGCNConfig
+        Contains stream_mode, use_delta, bone flags, etc.
+    device : str
+        "cpu", "cuda", or "mps".
+    """
+    body_parts_tracked = json.loads(body_parts_tracked_str)
+
+    if validate_or_submit == "submit":
+        test_subset = test[test.body_parts_tracked == body_parts_tracked_str]
+        generator = generate_mouse_data(
+            test_subset,
+            "test",
+            generate_single=(switch_tr == "single"),
+            generate_pair=(switch_tr == "pair"),
+            config=config,
+        )
+    else:
+        test_subset = stresstest.query("body_parts_tracked == @body_parts_tracked_str")
+        generator = generate_mouse_data(
+            test_subset,
+            "test",
+            traintest_directory="stresstest_tracking",
+            generate_single=(switch_tr == "single"),
+            generate_pair=(switch_tr == "pair"),
+            config=config,
+        )
+
+    if verbose:
+        print(f"n_videos: {len(test_subset)}")
+
+    ordered_joints, adjacency = get_ordered_joints_and_adjacency(body_parts_tracked)
+
+    mode = getattr(config, "stream_mode", "one")
+    if getattr(config, "two_stream", False) and mode == "one":
+        mode = "two"
+
+    for switch_te, data_te, meta_te, actions_te in generator:
+        assert switch_te == switch_tr
+
+        actions_available = [a for a in actions_te if a in model_dict]
+        if not actions_available:
+            if verbose:
+                print(f"  No CTR-GCN models for actions {actions_te}")
+            continue
+
+        if mode == "one":
+            window_tensor, frame_ranges = prepare_ctr_gcn_input(data_te, ordered_joints, config)
+            if window_tensor.shape[0] == 0:
+                continue
+            X = window_tensor.to(device)
+        elif mode == "two":
+            streamA_list, streamB_list, frame_ranges = prepare_ctr_gcn_input(data_te, ordered_joints, config)
+            if len(streamA_list) == 0:
+                continue
+            X_streamA = torch.stack(streamA_list, dim=0).to(device)
+            X_streamB = torch.stack(streamB_list, dim=0).to(device)
+        else:
+            coords_list, delta_list, bone_list, bone_delta_list, frame_ranges = prepare_ctr_gcn_input(data_te, ordered_joints, config)
+            if len(coords_list) == 0:
+                continue
+            X_coords = torch.stack(coords_list, dim=0).to(device)
+            X_delta = torch.stack(delta_list, dim=0).to(device)
+            X_bone = torch.stack(bone_list, dim=0).to(device)
+            X_bone_delta = torch.stack(bone_delta_list, dim=0).to(device)
+
+        if verbose and len(frame_ranges) == 0:
+            print("  No frame ranges produced.")
+            continue
+
+        frame_values = meta_te.video_frame.values
+        frame_to_idx = {f: i for i, f in enumerate(frame_values)}
+        n_frames = len(frame_values)
+        n_actions = len(actions_available)
+
+        sum_probs = np.zeros((n_frames, n_actions), dtype=np.float32)
+        counts = np.zeros((n_frames, n_actions), dtype=np.float32)
+
+        for action_idx, action_name in enumerate(actions_available):
+            model = model_dict[action_name]
+
+            with torch.no_grad():
+                if mode == "one":
+                    logits = model(X)
+                elif mode == "two":
+                    logits = model(X_streamA, X_streamB)
+                else:
+                    logits = model(X_coords, X_delta, X_bone, X_bone_delta)
+
+            probs = torch.sigmoid(logits).cpu().numpy().reshape(-1)
+
+            for w_idx, frames in enumerate(frame_ranges):
+                p = float(probs[w_idx])
+                for f in frames:
+                    fi = frame_to_idx.get(f)
+                    if fi is None:
+                        continue
+                    sum_probs[fi, action_idx] += p
+                    counts[fi, action_idx] += 1.0
+
+        counts_safe = counts.copy()
+        counts_safe[counts_safe == 0] = 1.0
+        pred_array = sum_probs / counts_safe
+
+        pred_df = pd.DataFrame(
+            pred_array,
+            index=meta_te.video_frame,
+            columns=actions_available,
+        )
+
+        submission_part = predict_multiclass(pred_df, meta_te)
+        submission_list.append(submission_part)
+
+
+"""
+# =============================
+# EXAMPLE: TRAIN → SAVE WEIGHTS
+# =============================
+# config = CTRGCNConfig(mode="validate")
+# batches = [...]  # from generate_mouse_data
+# ordered_joints, adjacency = get_ordered_joints_and_adjacency(body_parts_tracked)
+# model_dict = train_ctr_gcn_models(batches, ordered_joints, adjacency, config)
+
+# os.makedirs("models", exist_ok=True)
+# for action, model in model_dict.items():
+#     torch.save(model.state_dict(), f"models/{action}.pt")
+
+# =============================
+# EXAMPLE: LOAD WEIGHTS → INFERENCE
+# =============================
+# loaded_models = load_ctr_gcn_models(
+#     "models/",
+#     actions=list(model_dict.keys()),
+#     adjacency=adjacency,
+#     config=config,
+#     device="cpu",
+# )
+
+# submit_ctr_gcn(
+#     body_parts_tracked_str,
+#     switch_tr,
+#     loaded_models,
+#     config,
+#     device="cpu",
+# )
+"""
+
 '''
 # Challenge 4: A dataset that doesn't fit into memory
 
