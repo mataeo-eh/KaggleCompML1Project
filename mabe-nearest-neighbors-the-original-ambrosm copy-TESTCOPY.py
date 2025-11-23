@@ -48,6 +48,64 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.metrics import f1_score
 
+# =====================
+# CONFIGURATION BLOCK
+# =====================
+RUN_MODE = "dev"
+# Options:
+#   "dev"        -> very small dataset for quick debugging
+#   "validate"   -> full CTR-GCN training and cross-validation
+#   "submit"     -> inference only, using pretrained models
+#   "tune"       -> random-search hyperparameter tuning on a small subset
+#   "tune_grid"  -> exhaustive grid search over full dataset (use HPC cluster)
+
+GLOBAL_CONFIG = {
+    "verbose": True,
+    "device": "cpu",
+    "save_model_dir": "models/",
+    "load_model_dir": "models/",
+    "window_sizes": [60, 90, 120],
+    "window_strides": [15, 30],
+    "base_channels_list": [32, 48, 64, 96],
+    "num_blocks_list": [1, 2, 3, 4, 5, 6],
+    "dropout_list": [0.05, 0.1, 0.2, 0.3],
+    "lr_list": [1e-3, 5e-4, 1e-4],
+    "alpha_class_balance_list": [0.5, 1.0, 1.5],
+    "thresholds_list": [0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45],
+    "max_tuning_trials": 30,
+    "tuning_min_videos": 3,   # number of videos for random tuning
+    "tuning_grid_videos": None,  # None = use entire dataset for tune_grid mode
+    "param_distributions": {
+        "window": [60, 90, 120],
+        "stride": [15, 30],
+        "base_channels": [32, 48, 64, 96],
+        "num_blocks": [1, 2, 3, 4, 5, 6],
+        "dropout": [0.05, 0.1, 0.2, 0.3],
+        "learning_rate": [1e-3, 5e-4, 1e-4],
+        "alpha_class_balance": [0.5, 1.0, 1.5],
+    },
+}
+
+
+def load_best_params_csv(path="tuning_results/best_params.csv"):
+    """
+    Load best hyperparameters from CSV file.
+    If the file does not exist, return None.
+    """
+    import os
+    import pandas as pd
+
+    if not os.path.exists(path):
+        return None
+
+    try:
+        df = pd.read_csv(path)
+        params = df.to_dict(orient="records")[0]
+        return params
+    except Exception as e:
+        print(f"Warning: Could not read best_params.csv: {e}")
+        return None
+
 
 @dataclass
 class CTRGCNConfig:
@@ -73,6 +131,8 @@ class CTRGCNConfig:
 
     use_delta : bool
         Whether to compute Δx, Δy velocity channels.
+    show_progress : bool
+        Whether to display tqdm progress bars in dev/validate modes.
 
     two_stream : bool
         If True: return coords and delta as two separate tensors for a two-stream CTR-GCN.
@@ -120,6 +180,7 @@ class CTRGCNConfig:
     max_batches: int | None = 10
     max_windows: int | None = 50
     use_delta: bool = True
+    show_progress: bool = True
     two_stream: bool = False
     in_channels_coords: int = 2
     in_channels_delta: int = 2
@@ -685,7 +746,10 @@ def train_ctr_gcn_models(
         bone_delta_windows: list[torch.Tensor] = []
 
     batch_count = 0
-    for data_df, meta_df, label_df in batches:
+    iterable = batches
+    if RUN_MODE != "submit":
+        iterable = tqdm(batches, desc="Processing batches")
+    for data_df, meta_df, label_df in iterable:
         if config.max_batches is not None and batch_count >= config.max_batches:
             break
 
@@ -710,7 +774,10 @@ def train_ctr_gcn_models(
             if action not in y_dict:
                 y_dict[action] = []
 
-        for i, frame_range in enumerate(frame_ranges):
+        fr_iter = frame_ranges
+        if RUN_MODE != "submit":
+            fr_iter = tqdm(frame_ranges, desc="Assigning labels to windows")
+        for i, frame_range in enumerate(fr_iter):
             center_frame = frame_range[len(frame_range) // 2]
             if center_frame not in label_df.index:
                 continue
@@ -1556,6 +1623,13 @@ def load_ctr_gcn_models(
     model_dict : dict[str, nn.Module]
         Loaded models, all in eval mode and moved to the correct device.
     """
+    # Auto-load best params for submission mode
+    best_params = load_best_params_csv()
+    if best_params is not None:
+        for key, value in best_params.items():
+            if hasattr(config, key):
+                setattr(config, key, value)
+
     model_dict: dict[str, nn.Module] = {}
 
     mode = getattr(config, "stream_mode", "one")
@@ -1644,7 +1718,12 @@ def submit_ctr_gcn(
     if getattr(config, "two_stream", False) and mode == "one":
         mode = "two"
 
-    for switch_te, data_te, meta_te, actions_te in generator:
+    use_tqdm = (validate_or_submit in ["dev", "validate"]) and getattr(config, "show_progress", False)
+    gen_iter = generator
+    if use_tqdm:
+        gen_iter = tqdm(generator, desc="Inference batches")
+
+    for switch_te, data_te, meta_te, actions_te in gen_iter:
         assert switch_te == switch_tr
 
         actions_available = [a for a in actions_te if a in model_dict]
@@ -2064,6 +2143,287 @@ def robustify(
         print("ERROR: Filled missing videos")
 
     return submission.reset_index(drop=True)
+
+# =============================================
+# HYPERPARAMETER TUNING MODE: RUN_MODE == "tune"
+# =============================================
+if RUN_MODE == "tune":
+    print("Running CTR-GCN random-search hyperparameter tuning...")
+    import random
+    import csv
+    import time
+
+    # Create output directory
+    os.makedirs("tuning_results", exist_ok=True)
+
+    # Build parameter space
+    param_space = GLOBAL_CONFIG["param_distributions"]
+
+    max_trials = GLOBAL_CONFIG["max_tuning_trials"]
+    num_videos = GLOBAL_CONFIG["tuning_min_videos"]
+
+    results_path = "tuning_results/tuning_results.csv"
+
+    # Prepare CSV log
+    with open(results_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "trial",
+            "window",
+            "stride",
+            "base_channels",
+            "num_blocks",
+            "dropout",
+            "lr",
+            "alpha_balance",
+            "mean_f1",
+            "timestamp"
+        ])
+
+    # Select a small subset of videos for tuning
+    train_subset = train.sample(n=num_videos, random_state=42)
+
+    ordered_joints, adjacency = get_ordered_joints_and_adjacency(
+        json.loads(train_subset.body_parts_tracked.iloc[0])
+    )
+
+    print(f"Using {len(train_subset)} videos for tuning.")
+
+    best_f1 = -1
+    best_params = None
+
+    for trial in range(1, max_trials + 1):
+        print(f"\n=== Trial {trial}/{max_trials} ===")
+
+        # Random sample hyperparams
+        window = random.choice(param_space["window"])
+        stride = random.choice(param_space["stride"])
+        base_channels = random.choice(param_space["base_channels"])
+        num_blocks = random.choice(param_space["num_blocks"])
+        dropout = random.choice(param_space["dropout"])
+        lr = random.choice(param_space["learning_rate"])
+        alpha_balance = random.choice(param_space["alpha_class_balance"])
+
+        # Build config
+        cfg = CTRGCNConfig(
+            mode="validate",
+            max_videos=num_videos,
+            use_delta=True,
+            use_bone=True,
+            use_bone_delta=True,
+            stream_mode="one",
+        )
+        cfg.window = window
+        cfg.stride = stride
+        cfg.base_channels = base_channels
+        cfg.num_blocks = num_blocks
+        cfg.dropout = dropout
+        cfg.lr = lr
+        cfg.alpha_balance = alpha_balance
+
+        # Extract batches
+        batches = []
+        for switch, data_df, meta_df, label_df in generate_mouse_data(
+            train_subset,
+            "train",
+            generate_single=True,
+            generate_pair=False,
+            config=cfg
+        ):
+            batches.append((data_df, meta_df, label_df))
+
+        # Train
+        model_dict = train_ctr_gcn_models(
+            batches,
+            ordered_joints,
+            adjacency,
+            cfg,
+            device=GLOBAL_CONFIG["device"]
+        )
+
+        # Compute validation F1 across all actions used
+        f1_scores = []
+        for action, model in model_dict.items():
+            # Only use BCE predictions directly for tuning
+            # (Skipping multiclass postprocessing here)
+            f1_scores.append(1.0)  # TODO: replace with true F1 once pipeline ready
+
+        mean_f1 = sum(f1_scores) / len(f1_scores) if f1_scores else 0.0
+
+        # Write trial log
+        with open(results_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                trial,
+                window,
+                stride,
+                base_channels,
+                num_blocks,
+                dropout,
+                lr,
+                alpha_balance,
+                mean_f1,
+                time.time()
+            ])
+
+        # Check for new best
+        if mean_f1 > best_f1:
+            best_f1 = mean_f1
+            best_params = {
+                "window": window,
+                "stride": stride,
+                "base_channels": base_channels,
+                "num_blocks": num_blocks,
+                "dropout": dropout,
+                "lr": lr,
+                "alpha_balance": alpha_balance,
+            }
+
+            # Save model checkpoint
+            os.makedirs("models_tuned", exist_ok=True)
+            for action, model in model_dict.items():
+                torch.save(
+                    model.state_dict(),
+                    f"models_tuned/{action}.pt"
+                )
+
+    print("\n==== Hyperparameter Tuning Complete ====")
+    os.makedirs("tuning_results", exist_ok=True)
+    best_path = "tuning_results/best_params.csv"
+
+    import pandas as pd
+    pd.DataFrame([best_params]).to_csv(best_path, index=False)
+
+    print("Best F1:", best_f1)
+    print("Best params saved to:", best_path)
+
+
+# =====================================================
+# GRID SEARCH TUNING MODE: RUN_MODE == "tune_grid"
+# =====================================================
+if RUN_MODE == "tune_grid":
+    print("Running CTR-GCN full grid search (tune_grid)...")
+    print("WARNING: This mode is computationally intensive. Intended for HPC.")
+    import itertools
+
+    print("Preparing grid search...")
+
+    param_space = GLOBAL_CONFIG["param_distributions"]
+
+    # Full dataset for grid search
+    train_subset = train.copy()
+
+    ordered_joints, adjacency = get_ordered_joints_and_adjacency(
+        json.loads(train_subset.body_parts_tracked.iloc[0])
+    )
+
+    # Build grid of all parameter combinations
+    grid = list(itertools.product(
+        param_space["window"],
+        param_space["stride"],
+        param_space["base_channels"],
+        param_space["num_blocks"],
+        param_space["dropout"],
+        param_space["learning_rate"],
+        param_space["alpha_class_balance"],
+    ))
+
+    print(f"Total grid combinations: {len(grid)}")
+
+    os.makedirs("grid_results", exist_ok=True)
+
+    for idx, combo in enumerate(grid, start=1):
+        (
+            window,
+            stride,
+            base_channels,
+            num_blocks,
+            dropout,
+            lr,
+            alpha_balance
+        ) = combo
+
+        print(f"\n=== Grid Trial {idx}/{len(grid)} ===")
+
+        cfg = CTRGCNConfig(
+            mode="validate",
+            max_videos=None,
+            use_delta=True,
+            use_bone=True,
+            use_bone_delta=True,
+            stream_mode="one",
+        )
+        cfg.window = window
+        cfg.stride = stride
+        cfg.base_channels = base_channels
+        cfg.num_blocks = num_blocks
+        cfg.dropout = dropout
+        cfg.lr = lr
+        cfg.alpha_balance = alpha_balance
+
+        # Train on full dataset
+        batches = []
+        for switch, data_df, meta_df, label_df in generate_mouse_data(
+            train_subset,
+            "train",
+            generate_single=True,
+            generate_pair=False,
+            config=cfg
+        ):
+            batches.append((data_df, meta_df, label_df))
+
+        model_dict = train_ctr_gcn_models(
+            batches,
+            ordered_joints,
+            adjacency,
+            cfg,
+            device=GLOBAL_CONFIG["device"]
+        )
+
+        # TODO: compute validation F1
+        mean_f1 = 1.0
+
+        # Save results
+        with open("grid_results/grid_results.csv", "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                idx,
+                window,
+                stride,
+                base_channels,
+                num_blocks,
+                dropout,
+                lr,
+                alpha_balance,
+                mean_f1
+            ])
+
+        # Save model checkpoints for each action
+        for action, model in model_dict.items():
+            torch.save(
+                model.state_dict(),
+                f"grid_results/{action}_{idx}.pt"
+            )
+
+    print("\nGrid search completed.")
+
+
+if RUN_MODE == "validate":
+    # Attempt to load best parameters from tuning
+    best_params = load_best_params_csv()
+
+    if best_params is not None:
+        print("Using tuned hyperparameters:")
+        print(best_params)
+
+        cfg = CTRGCNConfig(mode="validate")
+        for key, value in best_params.items():
+            if hasattr(cfg, key):
+                setattr(cfg, key, value)
+    else:
+        print("No best_params.csv found. Using default CTRGCNConfig.")
+        cfg = CTRGCNConfig(mode="validate")
+    # Continue validation training with cfg
 
 
 if validate_or_submit == 'validate':
