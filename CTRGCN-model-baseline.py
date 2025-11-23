@@ -7,6 +7,7 @@ import random
 import itertools
 import csv
 import re
+from typing import Any
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,7 +21,7 @@ import torch.nn as nn
 # ======================
 RUN_MODE = "dev"  # one of: dev, validate, submit, tune, tune_grid
 STREAM_MODE = "one"  # one of: "one", "two", "four"
-traintest_directory_path = "/Data/train_tracking" # The path for dev testing the code with competition data
+traintest_directory_path = "./Data/train_tracking" # The path for dev testing the code with competition data
 
 GLOBAL_CONFIG = {
     "verbose": True,
@@ -561,6 +562,8 @@ def collect_ctr_gcn_windows(batches, ordered_joints, config: CTRGCNConfig):
     bone_windows_pair: list[torch.Tensor] = []
     bone_delta_windows_pair: list[torch.Tensor] = []
     y_dict_pair: dict[str, list] = {}
+    frame_ranges_single: list = []
+    frame_ranges_pair: list = []
 
     batch_count = 0
     for switch, data_df, meta_df, label_df in batches:
@@ -614,11 +617,13 @@ def collect_ctr_gcn_windows(batches, ordered_joints, config: CTRGCNConfig):
                     delta_windows_single.append(delta_list[i])
                     bone_windows_single.append(bone_list[i])
                     bone_delta_windows_single.append(bone_delta_list[i])
+                    frame_ranges_single.append(frame_range)
                 else:
                     coords_windows_pair.append(coords_list[i])
                     delta_windows_pair.append(delta_list[i])
                     bone_windows_pair.append(bone_list[i])
                     bone_delta_windows_pair.append(bone_delta_list[i])
+                    frame_ranges_pair.append(frame_range)
             target_dict = y_dict_single if switch == "single" else y_dict_pair
             for action in target_dict.keys():
                 val = label_row[action] if action in label_row else np.nan
@@ -626,7 +631,7 @@ def collect_ctr_gcn_windows(batches, ordered_joints, config: CTRGCNConfig):
 
         batch_count += 1
 
-    result = {}
+    result: dict[str, Any] = {}
     if mode == "one":
         single_tuple = ("one", torch.stack(X_windows_single, dim=0)) if len(X_windows_single) > 0 else ("one", torch.empty((0, config.in_channels_single_stream, len(ordered_joints), window_len)))
         pair_tuple = ("one", torch.stack(X_windows_pair, dim=0)) if len(X_windows_pair) > 0 else ("one", torch.empty((0, config.in_channels_single_stream, len(ordered_joints), window_len)))
@@ -637,16 +642,18 @@ def collect_ctr_gcn_windows(batches, ordered_joints, config: CTRGCNConfig):
         single_tuple = ("four", (coords_windows_single, delta_windows_single, bone_windows_single, bone_delta_windows_single))
         pair_tuple = ("four", (coords_windows_pair, delta_windows_pair, bone_windows_pair, bone_delta_windows_pair))
 
-    result["single"] = (single_tuple, y_dict_single)
-    result["pair"] = (pair_tuple, y_dict_pair)
+    result["windows_single"] = single_tuple
+    result["windows_pair"] = pair_tuple
+    result["labels"] = {"single": y_dict_single, "pair": y_dict_pair}
+    result["frame_ranges"] = {"single": frame_ranges_single, "pair": frame_ranges_pair}
     return result
 
 
 # ======================
 # TRAINING / VALIDATION UTIL
 # ======================
-def compute_validation_f1_from_windows(streams_tuple, y_dict: dict[str, list], adjacency: np.ndarray, config: CTRGCNConfig, device: str, seed: int = 0) -> float:
-    mode, data = streams_tuple
+def compute_validation_f1_from_windows(windows_tuple, y_dict: dict[str, list], adjacency: np.ndarray, config: CTRGCNConfig, device: str, seed: int = 0) -> float:
+    mode, data = windows_tuple
     if mode == "one" and data.shape[0] == 0:
         return 0.0
     if mode in ("two", "four"):
@@ -795,14 +802,21 @@ def train_ctr_gcn_models(batches, ordered_joints, adjacency, config: CTRGCNConfi
     model_dict_single: dict[str, nn.Module] = {}
     model_dict_pair: dict[str, nn.Module] = {}
 
-    streams_map = collect_ctr_gcn_windows(batches, ordered_joints, config)
+    data_dict = collect_ctr_gcn_windows(batches, ordered_joints, config)
+    windows_single = data_dict["windows_single"]
+    windows_pair = data_dict["windows_pair"]
+    labels_single = data_dict["labels"]["single"]
+    labels_pair = data_dict["labels"]["pair"]
     base_channels = getattr(config, "base_channels", 64)
     num_blocks = getattr(config, "num_blocks", 3)
     dropout = getattr(config, "dropout", 0.1)
     lr = getattr(config, "lr", 1e-3)
     alpha_balance = getattr(config, "alpha_balance", None)
 
-    for switch_name, (streams_tuple, y_dict) in streams_map.items():
+    for switch_name, streams_tuple, y_dict in [
+        ("single", windows_single, labels_single),
+        ("pair", windows_pair, labels_pair),
+    ]:
         mode, data = streams_tuple
         if mode == "one" and (data is None or data.shape[0] == 0):
             continue
@@ -1136,9 +1150,9 @@ if RUN_MODE == "tune":
             for switch, data_df, meta_df, label_df in generate_mouse_data(train_subset, "train", generate_single=True, generate_pair=True, config=cfg):
                 batches.append((switch, data_df, meta_df, label_df))
 
-        streams_tuple, y_dict = collect_ctr_gcn_windows(batches, ordered_joints, cfg)
-        mean_f1_single = compute_validation_f1_from_windows(streams_tuple["single"], y_dict["single"], adjacency, cfg, device=device, seed=trial)
-        mean_f1_pair = compute_validation_f1_from_windows(streams_tuple["pair"], y_dict["pair"], adjacency, cfg, device=device, seed=trial)
+        data_dict = collect_ctr_gcn_windows(batches, ordered_joints, cfg)
+        mean_f1_single = compute_validation_f1_from_windows(data_dict["windows_single"], data_dict["labels"]["single"], adjacency, cfg, device=device, seed=trial)
+        mean_f1_pair = compute_validation_f1_from_windows(data_dict["windows_pair"], data_dict["labels"]["pair"], adjacency, cfg, device=device, seed=trial)
         mean_f1 = np.mean([v for v in [mean_f1_single, mean_f1_pair] if v is not None])
 
         with open(results_path, "a", newline="") as f:
@@ -1222,38 +1236,38 @@ if RUN_MODE == "tune_grid":
             for switch, data_df, meta_df, label_df in generate_mouse_data(train_subset, "train", generate_single=True, generate_pair=True, config=cfg):
                 batches.append((switch, data_df, meta_df, label_df))
 
-        streams_tuple, y_dict = collect_ctr_gcn_windows(batches, ordered_joints, cfg)
-        mean_f1_single = compute_validation_f1_from_windows(streams_tuple["single"], y_dict["single"], adjacency, cfg, device=device, seed=idx)
-        mean_f1_pair = compute_validation_f1_from_windows(streams_tuple["pair"], y_dict["pair"], adjacency, cfg, device=device, seed=idx)
-        mean_f1 = np.mean([v for v in [mean_f1_single, mean_f1_pair] if v is not None])
+            data_dict = collect_ctr_gcn_windows(batches, ordered_joints, cfg)
+            mean_f1_single = compute_validation_f1_from_windows(data_dict["windows_single"], data_dict["labels"]["single"], adjacency, cfg, device=device, seed=idx)
+            mean_f1_pair = compute_validation_f1_from_windows(data_dict["windows_pair"], data_dict["labels"]["pair"], adjacency, cfg, device=device, seed=idx)
+            mean_f1 = np.mean([v for v in [mean_f1_single, mean_f1_pair] if v is not None])
 
-        with open(grid_results_path, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([idx, window, stride, base_channels, num_blocks, dropout, lr, alpha_balance, mean_f1])
+            with open(grid_results_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([idx, window, stride, base_channels, num_blocks, dropout, lr, alpha_balance, mean_f1])
 
-        if mean_f1 > best_f1:
-            best_f1 = mean_f1
-            best_params = {
-                "window": window,
-                "stride": stride,
-                "base_channels": base_channels,
-                "num_blocks": num_blocks,
-                "dropout": dropout,
-                "lr": lr,
-                "alpha_balance": alpha_balance,
-                "stream_mode": cfg.stream_mode,
-            }
+            if mean_f1 > best_f1:
+                best_f1 = mean_f1
+                best_params = {
+                    "window": window,
+                    "stride": stride,
+                    "base_channels": base_channels,
+                    "num_blocks": num_blocks,
+                    "dropout": dropout,
+                    "lr": lr,
+                    "alpha_balance": alpha_balance,
+                    "stream_mode": cfg.stream_mode,
+                }
 
-        model_dict_all = train_ctr_gcn_models(batches, ordered_joints, adjacency, cfg, device=device)
-        model_dir = get_stream_model_dir(cfg, bp_slug=bp_slug)
-        for action, model in model_dict_all["single"].items():
-            path_single = os.path.join(model_dir, "single")
-            os.makedirs(path_single, exist_ok=True)
-            torch.save(model.state_dict(), os.path.join(path_single, f"{action}_{idx}.pt"))
-        for action, model in model_dict_all["pair"].items():
-            path_pair = os.path.join(model_dir, "pair")
-            os.makedirs(path_pair, exist_ok=True)
-            torch.save(model.state_dict(), os.path.join(path_pair, f"{action}_{idx}.pt"))
+            model_dict_all = train_ctr_gcn_models(batches, ordered_joints, adjacency, cfg, device=device)
+            model_dir = get_stream_model_dir(cfg, bp_slug=bp_slug)
+            for action, model in model_dict_all["single"].items():
+                path_single = os.path.join(model_dir, "single")
+                os.makedirs(path_single, exist_ok=True)
+                torch.save(model.state_dict(), os.path.join(path_single, f"{action}_{idx}.pt"))
+            for action, model in model_dict_all["pair"].items():
+                path_pair = os.path.join(model_dir, "pair")
+                os.makedirs(path_pair, exist_ok=True)
+                torch.save(model.state_dict(), os.path.join(path_pair, f"{action}_{idx}.pt"))
 
         print("\nGrid search completed for", bp_slug)
         if best_params is not None:
