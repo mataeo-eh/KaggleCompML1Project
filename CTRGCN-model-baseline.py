@@ -233,10 +233,11 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
         pvid = pvid.reorder_levels([1, 2, 0], axis=1).T.sort_index().T
         pvid /= row.pix_per_cm_approx
 
-        vid_behaviors = json.loads(row.behaviors_labeled)
-        vid_behaviors = sorted(list({b.replace("'", "") for b in vid_behaviors}))
-        vid_behaviors = [b.split(",") for b in vid_behaviors]
+        behaviors_entries = json.loads(row.behaviors_labeled)
+        behaviors_entries = sorted(list({b.replace("'", "") for b in behaviors_entries}))
+        vid_behaviors = [b.split(",") for b in behaviors_entries]
         vid_behaviors = pd.DataFrame(vid_behaviors, columns=["agent", "target", "action"])
+        vid_behavior_actions = extract_actions_from_behaviors_labeled(row.behaviors_labeled)
 
         if traintest == "train":
             try:
@@ -1021,17 +1022,18 @@ def submit_ctr_gcn(body_parts_tracked_str: str, switch_tr: str, model_dict: dict
     body_parts_tracked = json.loads(body_parts_tracked_str)
     if RUN_MODE == "submit":
         test_subset = test[test.body_parts_tracked == body_parts_tracked_str]
-        generator = generate_mouse_data(test_subset, "test", generate_single=(switch_tr == "single"), generate_pair=(switch_tr == "pair"), config=config)
+        generator = generate_mouse_data(test_subset, "test", generate_single=True, generate_pair=True, config=config)
     else:
         test_subset = train.query("body_parts_tracked == @body_parts_tracked_str")
-        generator = generate_mouse_data(test_subset, "train", generate_single=(switch_tr == "single"), generate_pair=(switch_tr == "pair"), config=config)
+        generator = generate_mouse_data(test_subset, "train", generate_single=True, generate_pair=True, config=config)
 
     ordered_joints, adjacency = get_ordered_joints_and_adjacency(body_parts_tracked)
     mode = getattr(config, "stream_mode", "one")
 
     submissions = []
     for switch_te, data_te, meta_te, actions_te in generator:
-        assert switch_te == switch_tr
+        if switch_te != switch_tr:
+            continue
         actions_available = [a for a in actions_te if a in model_dict]
         if not actions_available:
             continue
@@ -1150,37 +1152,37 @@ if RUN_MODE == "tune":
             for switch, data_df, meta_df, label_df in generate_mouse_data(train_subset, "train", generate_single=True, generate_pair=True, config=cfg):
                 batches.append((switch, data_df, meta_df, label_df))
 
-        data_dict = collect_ctr_gcn_windows(batches, ordered_joints, cfg)
-        mean_f1_single = compute_validation_f1_from_windows(data_dict["windows_single"], data_dict["labels"]["single"], adjacency, cfg, device=device, seed=trial)
-        mean_f1_pair = compute_validation_f1_from_windows(data_dict["windows_pair"], data_dict["labels"]["pair"], adjacency, cfg, device=device, seed=trial)
-        mean_f1 = np.mean([v for v in [mean_f1_single, mean_f1_pair] if v is not None])
+            data_dict = collect_ctr_gcn_windows(batches, ordered_joints, cfg)
+            mean_f1_single = compute_validation_f1_from_windows(data_dict["windows_single"], data_dict["labels"]["single"], adjacency, cfg, device=device, seed=trial)
+            mean_f1_pair = compute_validation_f1_from_windows(data_dict["windows_pair"], data_dict["labels"]["pair"], adjacency, cfg, device=device, seed=trial)
+            mean_f1 = np.mean([v for v in [mean_f1_single, mean_f1_pair] if v is not None])
 
-        with open(results_path, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([trial, window, stride, base_channels, num_blocks, dropout, lr, alpha_balance, mean_f1, time.time()])
+            with open(results_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([trial, window, stride, base_channels, num_blocks, dropout, lr, alpha_balance, mean_f1, time.time()])
 
-        if mean_f1 > best_f1:
-            best_f1 = mean_f1
-            best_params = {
-                "window": window,
-                "stride": stride,
-                "base_channels": base_channels,
-                "num_blocks": num_blocks,
-                "dropout": dropout,
-                "lr": lr,
-                "alpha_balance": alpha_balance,
-                "stream_mode": cfg.stream_mode,
-            }
-            model_dir = get_stream_model_dir(cfg, bp_slug=bp_slug)
-            best_model_dict_all = train_ctr_gcn_models(batches, ordered_joints, adjacency, cfg, device=device)
-            for action, model in best_model_dict_all["single"].items():
-                path_single = os.path.join(model_dir, "single")
-                os.makedirs(path_single, exist_ok=True)
-                torch.save(model.state_dict(), os.path.join(path_single, f"{action}.pt"))
-            for action, model in best_model_dict_all["pair"].items():
-                path_pair = os.path.join(model_dir, "pair")
-                os.makedirs(path_pair, exist_ok=True)
-                torch.save(model.state_dict(), os.path.join(path_pair, f"{action}.pt"))
+            if mean_f1 > best_f1:
+                best_f1 = mean_f1
+                best_params = {
+                    "window": window,
+                    "stride": stride,
+                    "base_channels": base_channels,
+                    "num_blocks": num_blocks,
+                    "dropout": dropout,
+                    "lr": lr,
+                    "alpha_balance": alpha_balance,
+                    "stream_mode": cfg.stream_mode,
+                }
+                model_dir = get_stream_model_dir(cfg, bp_slug=bp_slug)
+                best_model_dict_all = train_ctr_gcn_models(batches, ordered_joints, adjacency, cfg, device=device)
+                for action, model in best_model_dict_all["single"].items():
+                    path_single = os.path.join(model_dir, "single")
+                    os.makedirs(path_single, exist_ok=True)
+                    torch.save(model.state_dict(), os.path.join(path_single, f"{action}.pt"))
+                for action, model in best_model_dict_all["pair"].items():
+                    path_pair = os.path.join(model_dir, "pair")
+                    os.makedirs(path_pair, exist_ok=True)
+                    torch.save(model.state_dict(), os.path.join(path_pair, f"{action}.pt"))
 
         print("\n==== Hyperparameter Tuning Complete for", bp_slug, "====")
         if best_params is not None:
