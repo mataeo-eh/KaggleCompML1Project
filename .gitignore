@@ -3,3 +3,6 @@ code_testing.py
 **/*pycache*
 **/.DS_Store
 Data/
+venv*
+TODO.md
+stresstest_tracking
