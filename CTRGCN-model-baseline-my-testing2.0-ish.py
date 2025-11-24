@@ -21,7 +21,7 @@ start_time = time.time()
 # ======================
 # CONFIGURATION
 # ======================
-RUN_MODE = "dev"  # one of: dev, validate, submit, tune, tune_grid
+RUN_MODE = "validate"  # one of: dev, validate, submit, tune, tune_grid
 STREAM_MODE = "one"  # one of: "one", "two", "four"
 traintest_directory_path = "./Data/train_tracking" # The path for dev testing the code with competition data
 
@@ -32,19 +32,14 @@ GLOBAL_CONFIG = {
     "max_tuning_trials": 60,
     "tuning_min_videos": 3,
     "param_distributions": {
-        "window": [32, 64, 96],
-        "stride": [16, 32],
-        "base_channels": [64, 96, 128],
-        "num_blocks": [8, 10, 12],
+        "window": [30, 60, 90, 120],
+        "stride": [7, 15, 30],
+        "base_channels": [32, 48, 64, 96],
+        "num_blocks": [1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20],
         "dropout": [0.05, 0.1, 0.2, 0.3],
-        "learning_rate": [0.1, 0.05, 0.01],
-        "momentum": [0.8, 0.9],
-        "weight_decay": [1e-4, 5e-4],
-        "batch_size": [32, 64],
-        "epochs": [60, 90, 120],
+        "learning_rate": [1, 0.1, 0.01, 1e-3, 5e-4, 1e-4],
         "alpha_class_balance": [0.5, 1.0, 1.5],
-        "decision_threshold" : [0.1, 0.2, 0.25, 0.30, 0.35],
-        "temporal_kernel_size": [5, 7, 9],
+        "decision_threshold" : [0.1, 0.2, 0.25, 0.30, 0.35, 0.40, 0.45],
     },
 }
 
@@ -80,26 +75,14 @@ class CTRGCNConfig:
     in_channels_bone_only: int = 2
     in_channels_bone_delta_only: int = 2
 
-    window: int = 64
-    stride: int = 32
-    base_channels: int = 64
+    window: int = 50
+    stride: int = 15
+    base_channels: int = 96
     num_blocks: int = 12
-    temporal_kernel_size: int = 9
-    use_ctr: bool = True
-    use_edge_importance: bool = True
     dropout: float = 0.1
-    lr: float = 0.1
-    momentum: float = 0.9
-    weight_decay: float = 1e-4
-    batch_size: int = 64
-    epochs: int = 120
-    grad_clip: float = 1.0
+    lr: float = 1e-3
     alpha_balance: float | None = None
-    decision_threshold: float = 0.2
-    use_random_crop: bool = True
-    use_random_rotation: bool = True
-    max_rotation_deg: float = 15.0
-    crop_jitter_frames: int = 8
+    decision_threshold: float | None = 0.2
 
 
 # ======================
@@ -116,7 +99,7 @@ def slugify_bodyparts(bp_str: str) -> str:
 
 
 def get_stream_model_dir(cfg: CTRGCNConfig, bp_slug: str | None = None) -> str:
-    root = "./CTR-GCN-Models2.0"
+    root = "./CTR-GCN-Models"
     tag = get_stream_mode_tag(cfg)
     sub = {"one": "one_stream", "two": "two_stream", "four": "four_stream"}[tag]
     if bp_slug is None:
@@ -449,56 +432,83 @@ def _normalize_adjacency_chain(adjacency: np.ndarray) -> np.ndarray:
     row_sum[row_sum == 0.0] = 1.0
     return A / row_sum
 
+class DynamicAdjacency(nn.Module):
+    def __init__(self, in_channels, reduction_ratio=8):
+        super().__init__()
+        hidden = max(in_channels // reduction_ratio, 16)
 
+        self.theta = nn.Conv2d(in_channels, hidden, 1)
+        self.phi   = nn.Conv2d(in_channels, hidden, 1)
+        self.g     = nn.Conv2d(in_channels, hidden, 1)
 
+        self.out_proj = nn.Conv2d(hidden, in_channels, 1)
+
+    def forward(self, x):  
+        # x: (N, C, V, T)
+        theta = self.theta(x).mean(-1)  # (N, hidden, V)
+        phi   = self.phi(x).mean(-1)    # (N, hidden, V)
+
+        att = torch.matmul(theta.transpose(2,1), phi)  # (N, V, V)
+        att = torch.softmax(att, dim=-1)               # softmax-row normalized
+
+        return att
+    
 class CTRGraphConv(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, adjacency: np.ndarray, coff_embedding: int = 4, use_ctr: bool = True):
+    def __init__(self, in_channels, out_channels, adjacency):
         super().__init__()
         A_norm = _normalize_adjacency_chain(adjacency)
-        self.A_base = nn.Parameter(torch.from_numpy(A_norm), requires_grad=True)
-        self.use_ctr = use_ctr
-        inter_channels = max(1, out_channels // coff_embedding)
-        self.theta = nn.Conv2d(out_channels, inter_channels, kernel_size=1)
-        self.phi = nn.Conv2d(out_channels, inter_channels, kernel_size=1)
-        self.alpha = nn.Parameter(torch.zeros(1))
-        self.proj = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=True)
-        self.bn = nn.BatchNorm2d(out_channels)
+        self.register_buffer("A", torch.from_numpy(A_norm))
 
-    def forward(self, x: torch.Tensor, edge_importance: torch.Tensor | None = None) -> torch.Tensor:
-        # x: (N, C_in, V, T)
-        x = self.proj(x)  # (N, C_out, V, T)
-        A_eff = self.A_base
-        if edge_importance is not None:
-            A_eff = A_eff * edge_importance
+        # Static branch
+        self.conv_static = nn.Conv2d(in_channels, out_channels, 1)
 
-        if self.use_ctr:
-            theta_x = self.theta(x)  # (N, C_mid, V, T)
-            phi_x = self.phi(x)
-            N, C_mid, V, T = theta_x.shape
-            theta_f = theta_x.reshape(N, C_mid, V * T)
-            phi_f = phi_x.reshape(N, C_mid, V * T)
-            refine = torch.matmul(theta_f.transpose(1, 2), phi_f)  # (N, V, V)
-            refine = refine / (C_mid ** 0.5)
-            refine = torch.tanh(refine).mean(dim=0)  # (V, V)
-            A_eff = A_eff + self.alpha * refine
+        # Learnable adjacency branch (dynamic)
+        self.dynamic_adj = DynamicAdjacency(in_channels)
+        self.conv_dynamic = nn.Conv2d(in_channels, out_channels, 1)
 
-        x = torch.einsum("ncvt,vw->ncwt", x, A_eff)
-        x = self.bn(x)
-        return x
+        # Pointwise branch (local mixing)
+        self.conv_pointwise = nn.Conv2d(in_channels, out_channels, 1)
+
+    def forward(self, x):
+        # --- 1. Static spatial graph ---
+        static = torch.einsum("ncvT,vw->ncwT", x, self.A)
+        static = self.conv_static(static)
+
+        # --- 2. Dynamic learned adjacency ---
+        dyn_A = self.dynamic_adj(x)  # (N, V, V)
+        dyn   = torch.einsum("ncvT,nvw->ncwT", x, dyn_A)
+        dyn   = self.conv_dynamic(dyn)
+
+        # --- 3. Pointwise feature mixing ---
+        pw = self.conv_pointwise(x)
+
+        return static + dyn + pw
 
 
-class CTRGCNBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, adjacency: np.ndarray, stride: int = 1, dropout: float = 0.1, temporal_kernel: int = 9, use_ctr: bool = True, edge_importance: bool = True):
+class STBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, adjacency,
+                 stride=1, dropout=0.1, kernel_size=9):
         super().__init__()
-        self.gcn = CTRGraphConv(in_channels, out_channels, adjacency, use_ctr=use_ctr)
-        pad_t = temporal_kernel // 2
+
+        self.gcn = CTRGraphConv(in_channels, out_channels, adjacency)
+
+        pad = (kernel_size - 1) // 2
+
         self.tcn = nn.Sequential(
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=(1, temporal_kernel), padding=(0, pad_t), stride=(1, stride), bias=True),
+            nn.Conv2d(
+                out_channels,
+                out_channels,
+                kernel_size=(1, kernel_size),
+                padding=(0, pad),
+                stride=(1, stride),
+                bias=False,
+            ),
             nn.BatchNorm2d(out_channels),
             nn.Dropout(dropout),
         )
+
         if (in_channels != out_channels) or (stride != 1):
             self.residual = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=(1, stride), bias=False),
@@ -506,50 +516,61 @@ class CTRGCNBlock(nn.Module):
             )
         else:
             self.residual = nn.Identity()
-        self.relu = nn.ReLU(inplace=True)
-        self.edge_importance = edge_importance
 
-    def forward(self, x: torch.Tensor, edge_importance: torch.Tensor | None = None) -> torch.Tensor:
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
         res = self.residual(x)
-        x = self.gcn(x, edge_importance if self.edge_importance else None)
+        x = self.gcn(x)
         x = self.tcn(x)
         x = x + res
         x = self.relu(x)
         return x
 
 
-class CTRGCNBackbone(nn.Module):
-    def __init__(self, in_channels: int, num_classes: int, adjacency: np.ndarray, channels: list[int] | None = None, dropout: float = 0.1, temporal_kernel: int = 9, use_ctr: bool = True, use_edge_importance: bool = True):
+
+class CTRGCNMinimal(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        num_classes: int,
+        adjacency: np.ndarray,
+        channels = [64]*4 + [96]*4 + [128]*4,
+        dropout: float = 0.1,
+    ):
         super().__init__()
-        if channels is None:
-            channels = [64, 64, 64, 64, 96, 96, 96, 96, 128, 128, 128, 128]
+
+        # channels is now a tuple or list defining progressive expansion
+        assert len(channels) >= 1
         blocks = []
         last_c = in_channels
-        self.edge_importance = nn.ParameterList(
-            [nn.Parameter(torch.ones_like(torch.from_numpy(_normalize_adjacency_chain(adjacency))), requires_grad=True) if use_edge_importance else nn.Parameter(torch.ones_like(torch.from_numpy(_normalize_adjacency_chain(adjacency))), requires_grad=False) for _ in channels]
-        )
-        for idx, out_c in enumerate(channels):
-            blocks.append(CTRGCNBlock(last_c, out_c, adjacency, stride=1, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, edge_importance=use_edge_importance))
+
+        for out_c in channels:
+            blocks.append(STBlock(last_c, out_c, adjacency, stride=1, dropout=dropout))
             last_c = out_c
+
         self.st_blocks = nn.ModuleList(blocks)
+
+        # classifier automatically adapts to last channel
         self.fc = nn.Linear(last_c, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (N, C, V, T)
         out = x
-        for block, imp in zip(self.st_blocks, self.edge_importance):
-            out = block(out, imp)
-        out = out.mean(dim=-2)  # (N, C_out, T)
-        out = out.permute(0, 2, 1)  # (N, T, C_out)
-        logits = self.fc(out)
+        for block in self.st_blocks:
+            out = block(out)
+
+        out = out.mean(dim=-2)         # (N, C_out, T)
+        out = out.permute(0, 2, 1)     # (N, T, C_out)
+        logits = self.fc(out)          # (N, T, num_classes)
         return logits
 
 
 class CTRGCNTwoStream(nn.Module):
-    def __init__(self, adjacency: np.ndarray, in_channels_coords: int = 2, in_channels_delta: int = 2, base_channels: int = 64, num_blocks: int = 12, dropout: float = 0.1, temporal_kernel: int = 9, use_ctr: bool = True, use_edge_importance: bool = True):
+    def __init__(self, adjacency: np.ndarray, in_channels_coords: int = 2, in_channels_delta: int = 2, base_channels: int = 64, num_blocks: int = 3, dropout: float = 0.1):
         super().__init__()
-        channels = [base_channels] * num_blocks
-        self.stream_coords = CTRGCNBackbone(in_channels_coords, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
-        self.stream_delta = CTRGCNBackbone(in_channels_delta, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
+        self.stream_coords = CTRGCNMinimal(in_channels_coords, base_channels, adjacency, base_channels, num_blocks, dropout)
+        self.stream_delta = CTRGCNMinimal(in_channels_delta, base_channels, adjacency, base_channels, num_blocks, dropout)
         self.fc = nn.Linear(base_channels, 1)
 
     def forward(self, coords_x: torch.Tensor, delta_x: torch.Tensor) -> torch.Tensor:
@@ -561,13 +582,12 @@ class CTRGCNTwoStream(nn.Module):
 
 
 class CTRGCNFourStream(nn.Module):
-    def __init__(self, adjacency, base_channels=64, dropout=0.1, num_blocks=12, temporal_kernel: int = 9, use_ctr: bool = True, use_edge_importance: bool = True):
+    def __init__(self, adjacency, base_channels=64, dropout=0.1, num_blocks=3):
         super().__init__()
-        channels = [base_channels] * num_blocks
-        self.stream_coords = CTRGCNBackbone(2, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
-        self.stream_delta = CTRGCNBackbone(2, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
-        self.stream_bone = CTRGCNBackbone(2, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
-        self.stream_bone_delta = CTRGCNBackbone(2, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
+        self.stream_coords = CTRGCNMinimal(2, base_channels, adjacency, base_channels, num_blocks, dropout)
+        self.stream_delta = CTRGCNMinimal(2, base_channels, adjacency, base_channels, num_blocks, dropout)
+        self.stream_bone = CTRGCNMinimal(2, base_channels, adjacency, base_channels, num_blocks, dropout)
+        self.stream_bone_delta = CTRGCNMinimal(2, base_channels, adjacency, base_channels, num_blocks, dropout)
         self.fc = nn.Linear(base_channels, 1)
 
     def forward(self, coords_x, delta_x, bone_x, bone_delta_x):
@@ -931,19 +951,13 @@ def compute_validation_f1_from_windows(windows_tuple, y_dict: dict[str, list], a
         train_idx = perm[:split_idx]
         val_idx = perm[split_idx:]
 
-        temporal_kernel = getattr(config, "temporal_kernel_size", 9)
-        use_ctr = getattr(config, "use_ctr", True)
-        use_edge_importance = getattr(config, "use_edge_importance", True)
         if mode == "one":
-            model = CTRGCNBackbone(
+            model = CTRGCNMinimal(
                 in_channels=config.in_channels_single_stream,
                 num_classes=1,
                 adjacency=adjacency,
-                channels=[base_channels] * num_blocks,
+                channels= [64]*4 + [96]*4 + [128]*4,
                 dropout=dropout,
-                temporal_kernel=temporal_kernel,
-                use_ctr=use_ctr,
-                use_edge_importance=use_edge_importance,
             ).to(device)
         elif mode == "two":
             model = CTRGCNTwoStream(
@@ -953,22 +967,11 @@ def compute_validation_f1_from_windows(windows_tuple, y_dict: dict[str, list], a
                 base_channels=base_channels,
                 num_blocks=num_blocks,
                 dropout=dropout,
-                temporal_kernel=temporal_kernel,
-                use_ctr=use_ctr,
-                use_edge_importance=use_edge_importance,
             ).to(device)
         else:
-            model = CTRGCNFourStream(
-                adjacency=adjacency,
-                base_channels=base_channels,
-                dropout=dropout,
-                num_blocks=num_blocks,
-                temporal_kernel=temporal_kernel,
-                use_ctr=use_ctr,
-                use_edge_importance=use_edge_importance,
-            ).to(device)
+            model = CTRGCNFourStream(adjacency=adjacency, base_channels=base_channels, dropout=dropout, num_blocks=num_blocks).to(device)
 
-        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=getattr(config, "momentum", 0.9), weight_decay=getattr(config, "weight_decay", 1e-4))
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         if alpha_balance is not None:
             pos_weight = torch.tensor([alpha_balance], device=device)
             criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
@@ -1001,9 +1004,6 @@ def compute_validation_f1_from_windows(windows_tuple, y_dict: dict[str, list], a
                 optimizer.zero_grad()
                 loss = criterion(logits, batch_y)
                 loss.backward()
-                clip_val = getattr(config, "grad_clip", None)
-                if clip_val is not None:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_val)
                 optimizer.step()
 
         model.eval()
@@ -1103,13 +1103,13 @@ def train_ctr_gcn_models(batches, ordered_joints, adjacency, config: CTRGCNConfi
             else:
                 print(f"[train_ctr_gcn_models] switch={switch_name} coords {X_coords.shape}, delta {X_delta.shape}, bone {X_bone.shape}, bone_delta {X_bone_delta.shape}")
 
-        batch_size = getattr(config, "batch_size", 16)
+        batch_size = 16
         if config.mode == "dev":
             epochs = 1
         elif config.mode == "validate":
             epochs = 3
         else:
-            epochs = getattr(config, "epochs", 5)
+            epochs = 5
 
         # Choose adjacency based on switch (single vs pair)
         adjacency_local = adjacency if switch_name == "single" else make_pair_adjacency(adjacency)
@@ -1129,22 +1129,15 @@ def train_ctr_gcn_models(batches, ordered_joints, adjacency, config: CTRGCNConfi
 
 
 
-            temporal_kernel = getattr(config, "temporal_kernel_size", 9)
-            use_ctr = getattr(config, "use_ctr", True)
-            use_edge_importance = getattr(config, "use_edge_importance", True)
-
             if mode == "one":
                 X_action = X
                 x_len = X_action.shape[0]
-                model = CTRGCNBackbone(
+                model = CTRGCNMinimal(
                     in_channels=config.in_channels_single_stream,
                     num_classes=1,
                     adjacency=adjacency_local,
-                    channels=[base_channels] * num_blocks,
+                    channels= [64]*4 + [96]*4 + [128]*4,
                     dropout=dropout,
-                    temporal_kernel=temporal_kernel,
-                    use_ctr=use_ctr,
-                    use_edge_importance=use_edge_importance,
                 ).to(device)
             elif mode == "two":
                 X_action_A = X_streamA
@@ -1157,32 +1150,26 @@ def train_ctr_gcn_models(batches, ordered_joints, adjacency, config: CTRGCNConfi
                     base_channels=base_channels,
                     num_blocks=num_blocks,
                     dropout=dropout,
-                    temporal_kernel=temporal_kernel,
-                    use_ctr=use_ctr,
-                    use_edge_importance=use_edge_importance,
                 ).to(device)
             else:
-                X_action_coords = X_coords
-                X_action_delta = X_delta
-                X_action_bone = X_bone
-                X_action_bone_delta = X_bone_delta
-                x_len = min(
+                    X_action_coords = X_coords
+                    X_action_delta = X_delta
+                    X_action_bone = X_bone
+                    X_action_bone_delta = X_bone_delta
+                    x_len = min(
                     X_action_coords.shape[0],
                     X_action_delta.shape[0],
                     X_action_bone.shape[0],
                     X_action_bone_delta.shape[0],
-                )
-                model = CTRGCNFourStream(
-                    adjacency=adjacency_local,
-                    base_channels=base_channels,
-                    dropout=dropout,
-                    num_blocks=num_blocks,
-                    temporal_kernel=temporal_kernel,
-                    use_ctr=use_ctr,
-                    use_edge_importance=use_edge_importance,
-                ).to(device)
+                    )
+                    model = CTRGCNFourStream(
+                        adjacency=adjacency_local,
+                        base_channels=base_channels,
+                        dropout=dropout,
+                        num_blocks=num_blocks,
+                    ).to(device)
 
-            optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=getattr(config, "momentum", 0.9), weight_decay=getattr(config, "weight_decay", 1e-4))
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr)
             if alpha_balance is not None:
                 pos_weight = torch.tensor([alpha_balance], device=device)
                 criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
@@ -1222,9 +1209,6 @@ def train_ctr_gcn_models(batches, ordered_joints, adjacency, config: CTRGCNConfi
                     optimizer.zero_grad()
                     loss = criterion(logits, batch_y_masked)
                     loss.backward()
-                    clip_val = getattr(config, "grad_clip", None)
-                    if clip_val is not None:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), clip_val)
                     optimizer.step()
 
             if switch_name == "single":
@@ -1307,19 +1291,13 @@ def load_ctr_gcn_models(model_dir: str | None, actions: list[str], adjacency: np
     os.makedirs(model_dir, exist_ok=True)
 
     for action in actions:
-        temporal_kernel = getattr(config, "temporal_kernel_size", 9)
-        use_ctr = getattr(config, "use_ctr", True)
-        use_edge_importance = getattr(config, "use_edge_importance", True)
         if mode == "one":
-            model = CTRGCNBackbone(
+            model = CTRGCNMinimal(
                 in_channels=config.in_channels_single_stream,
                 num_classes=1,
                 adjacency=adjacency_local,
-                channels=[base_channels] * num_blocks,
+                channels= [64]*4 + [96]*4 + [128]*4,
                 dropout=dropout,
-                temporal_kernel=temporal_kernel,
-                use_ctr=use_ctr,
-                use_edge_importance=use_edge_importance,
             )
         elif mode == "two":
             model = CTRGCNTwoStream(
@@ -1329,20 +1307,9 @@ def load_ctr_gcn_models(model_dir: str | None, actions: list[str], adjacency: np
                 base_channels=base_channels,
                 num_blocks=num_blocks,
                 dropout=dropout,
-                temporal_kernel=temporal_kernel,
-                use_ctr=use_ctr,
-                use_edge_importance=use_edge_importance,
             )
         elif mode == "four":
-            model = CTRGCNFourStream(
-                adjacency=adjacency_local,
-                base_channels=base_channels,
-                dropout=dropout,
-                num_blocks=num_blocks,
-                temporal_kernel=temporal_kernel,
-                use_ctr=use_ctr,
-                use_edge_importance=use_edge_importance,
-            )
+            model = CTRGCNFourStream(adjacency=adjacency_local, base_channels=base_channels, dropout=dropout, num_blocks=num_blocks)
         else:
             raise ValueError(f"Unsupported stream_mode: {mode}")
 
@@ -1487,7 +1454,7 @@ if RUN_MODE == "tune":
         results_path = os.path.join("tuning_results", f"tuning_results_{stream_mode}_{bp_slug}.csv")
         with open(results_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["trial", "window", "stride", "base_channels", "num_blocks", "dropout", "lr", "momentum", "weight_decay", "batch_size", "epochs", "temporal_kernel_size", "alpha_balance", "decision_threshold", "mean_f1", "timestamp"])
+            writer.writerow(["trial", "window", "stride", "base_channels", "num_blocks", "dropout", "lr", "alpha_balance", "decision_threshold", "mean_f1", "timestamp"])
 
         best_f1 = -1
         best_params = None
@@ -1499,11 +1466,6 @@ if RUN_MODE == "tune":
             num_blocks = random.choice(param_space["num_blocks"])
             dropout = random.choice(param_space["dropout"])
             lr = random.choice(param_space["learning_rate"])
-            momentum = random.choice(param_space.get("momentum", [0.9]))
-            weight_decay = random.choice(param_space.get("weight_decay", [1e-4]))
-            batch_size = random.choice(param_space.get("batch_size", [64]))
-            epochs = random.choice(param_space.get("epochs", [120]))
-            temporal_kernel = random.choice(param_space.get("temporal_kernel_size", [9]))
             alpha_balance = random.choice(param_space["alpha_class_balance"])
             decision_threshold = random.choice(param_space["decision_threshold"])
 
@@ -1514,11 +1476,6 @@ if RUN_MODE == "tune":
             cfg.num_blocks = num_blocks
             cfg.dropout = dropout
             cfg.lr = lr
-            cfg.momentum = momentum
-            cfg.weight_decay = weight_decay
-            cfg.batch_size = batch_size
-            cfg.epochs = epochs
-            cfg.temporal_kernel_size = temporal_kernel
             cfg.alpha_balance = alpha_balance
             cfg.decision_threshold = decision_threshold
             cfg.max_batches = None
@@ -1535,7 +1492,7 @@ if RUN_MODE == "tune":
 
             with open(results_path, "a", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow([trial, window, stride, base_channels, num_blocks, dropout, lr, momentum, weight_decay, batch_size, epochs, temporal_kernel, alpha_balance, decision_threshold, mean_f1, time.time()])
+                writer.writerow([trial, window, stride, base_channels, num_blocks, dropout, lr, alpha_balance, decision_threshold, mean_f1, time.time()])
 
             if mean_f1 > best_f1:
                 best_f1 = mean_f1
@@ -1587,25 +1544,20 @@ if RUN_MODE == "tune_grid":
                 param_space["num_blocks"],
                 param_space["dropout"],
                 param_space["learning_rate"],
-                param_space.get("momentum", [0.9]),
-                param_space.get("weight_decay", [1e-4]),
-                param_space.get("batch_size", [64]),
-                param_space.get("epochs", [120]),
                 param_space["alpha_class_balance"],
                 param_space["decision_threshold"],
-                param_space.get("temporal_kernel_size", [9]),
             )
         )
         tag = stream_mode
         grid_results_path = os.path.join("grid_results", f"grid_results_{tag}_{bp_slug}.csv")
         with open(grid_results_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["idx", "window", "stride", "base_channels", "num_blocks", "dropout", "lr", "momentum", "weight_decay", "batch_size", "epochs", "alpha_balance", "decision_threshold", "temporal_kernel_size", "mean_f1"])
+            writer.writerow(["idx", "window", "stride", "base_channels", "num_blocks", "dropout", "lr", "alpha_balance", "decision_threshold", "mean_f1"])
 
         best_f1 = -1.0
         best_params = None
         for idx, combo in enumerate(grid, start=1):
-            window, stride, base_channels, num_blocks, dropout, lr, momentum, weight_decay, batch_size, epochs, alpha_balance, decision_threshold, temporal_kernel = combo
+            window, stride, base_channels, num_blocks, dropout, lr, alpha_balance, decision_threshold = combo
             cfg = CTRGCNConfig(mode="validate", max_videos=None, use_delta=True, use_bone=True, use_bone_delta=True, stream_mode=stream_mode)
             cfg.window = window
             cfg.stride = stride
@@ -1613,11 +1565,6 @@ if RUN_MODE == "tune_grid":
             cfg.num_blocks = num_blocks
             cfg.dropout = dropout
             cfg.lr = lr
-            cfg.momentum = momentum
-            cfg.weight_decay = weight_decay
-            cfg.batch_size = batch_size
-            cfg.epochs = epochs
-            cfg.temporal_kernel_size = temporal_kernel
             cfg.alpha_balance = alpha_balance
             cfg.decision_threshold = decision_threshold
             cfg.max_batches = None
@@ -1634,7 +1581,7 @@ if RUN_MODE == "tune_grid":
 
             with open(grid_results_path, "a", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow([idx, window, stride, base_channels, num_blocks, dropout, lr, momentum, weight_decay, batch_size, epochs, alpha_balance, decision_threshold, temporal_kernel, mean_f1])
+                writer.writerow([idx, window, stride, base_channels, num_blocks, dropout, lr, alpha_balance, decision_threshold, mean_f1])
 
             if mean_f1 > best_f1:
                 best_f1 = mean_f1
@@ -1929,8 +1876,8 @@ if RUN_MODE == "dev":
                 max_videos=None,  # limit handled by slicing above
                 max_batches=20,
                 max_windows=100,
-                window=64,
-                stride=32,
+                window=30,
+                stride=15,
                 show_progress=True,
                 stream_mode=GLOBAL_CONFIG.get("stream_mode", "one"),
             )
@@ -2052,6 +1999,11 @@ if RUN_MODE == "dev":
             overall_f1 = sum(dev_f1_scores) / len(dev_f1_scores)
             print(f"\n[DEV] Average holdout F1 across body-part sets: {overall_f1:.4f}")
 
+
+
+#=========================================
+#       Validate Mode Configs etc.
+#=========================================
 if RUN_MODE == "validate":
     for bp_str in body_parts_tracked_list:
         train_subset = train[train.body_parts_tracked == bp_str]
@@ -2070,30 +2022,53 @@ if RUN_MODE == "validate":
 
         ordered_joints, adjacency = get_ordered_joints_and_adjacency(filter_tracked_body_parts(json.loads(bp_str)))
 
-        # Holdout dev-style evaluation for foresight (5 epochs via submit mode)
-        unique_vids = train_subset.video_id.unique()
+        # ============================
+        # 80/20 Holdout Evaluation
+        # ============================
+
+        unique_vids = list(train_subset.video_id.unique())
         best_holdout_f1 = 0.0
         best_holdout_models = None
-        if len(unique_vids) >= 2:
-            # 80/20 split
-            rng = np.random.default_rng(42)
-            perm = rng.permutation(unique_vids)
-            split_idx = max(1, int(0.8 * len(perm)))
-            train_vids = perm[:split_idx]
-            val_vids = perm[split_idx:]
-            if len(val_vids) == 0:  # ensure at least 1 val video
-                val_vids = perm[-1:]
-                train_vids = perm[:-1]
-            train_part = train_subset[train_subset.video_id.isin(train_vids)]
-            val_part = train_subset[train_subset.video_id.isin(val_vids)]
 
+        # Need at least 2 videos for a validation split
+        if len(unique_vids) >= 2:
+
+            # Shuffle for reproducibility
+            rng = np.random.default_rng(seed=42)
+            rng.shuffle(unique_vids)
+
+            # 80% / 20% split
+            split_idx = max(1, int(len(unique_vids) * 0.8))
+            train_vids = unique_vids[:split_idx]
+            val_vids   = unique_vids[split_idx:]
+
+            train_part = train_subset[train_subset.video_id.isin(train_vids)]
+            val_part   = train_subset[train_subset.video_id.isin(val_vids)]
+
+            # Safety check
+            if len(val_vids) == 0:
+                print("[VALIDATE] WARNING: Not enough videos for validation split; skipping.")
+                val_vids = unique_vids[-1:]         # force 1 video into val
+                train_vids = unique_vids[:-1]
+                train_part = train_subset[train_subset.video_id.isin(train_vids)]
+                val_part = train_subset[train_subset.video_id.isin(val_vids)]
+
+            print(f"[SPLIT] Train videos = {len(train_vids)}, Val videos = {len(val_vids)}")
+            print(f"[SPLIT] Train frames = {len(train_part)}, Val frames = {len(val_part)}")
+
+            # -------------------------------
+            # Build evaluation config
+            # -------------------------------
             eval_cfg = CTRGCNConfig(mode="submit", stream_mode=cfg.stream_mode)
             for key, value in (best_params or {}).items():
                 if hasattr(eval_cfg, key):
                     setattr(eval_cfg, key, value)
-            eval_cfg.max_batches = None
-            eval_cfg.max_windows = None
+            eval_cfg.max_batches = 40
+            eval_cfg.max_windows = 1000
 
+            # -------------------------------
+            # Build training batches
+            # -------------------------------
             eval_batches = []
             for switch, data_df, meta_df, label_df in generate_mouse_data(
                 train_part, "train", generate_single=True, generate_pair=True, config=eval_cfg
@@ -2101,41 +2076,57 @@ if RUN_MODE == "validate":
                 eval_batches.append((switch, data_df, meta_df, label_df))
 
             if eval_batches:
-                model_eval = train_ctr_gcn_models(eval_batches, ordered_joints, adjacency, eval_cfg, device=GLOBAL_CONFIG["device"])
+                # ============================
+                # Train models on the 80% train split
+                # ============================
+                model_eval = train_ctr_gcn_models(
+                    eval_batches, ordered_joints, adjacency, eval_cfg,
+                    device=GLOBAL_CONFIG["device"]
+                )
 
+                # ============================
+                # Evaluate on 20% held-out split
+                # ============================
                 submissions_local: list[pd.DataFrame] = []
                 for switch, data_df, meta_df, label_df in generate_mouse_data(
                     val_part, "train", generate_single=True, generate_pair=True, config=eval_cfg
                 ):
+
                     actions_te = list(label_df.columns)
                     mode = getattr(eval_cfg, "stream_mode", "one")
+
+                    # Prepare inputs (same as original)
                     if mode == "one":
                         window_tensor, frame_ranges = prepare_ctr_gcn_input(data_df, ordered_joints, eval_cfg)
                         if window_tensor.shape[0] == 0:
                             continue
                         X = window_tensor.to(GLOBAL_CONFIG["device"])
+
                     elif mode == "two":
                         streamA_list, streamB_list, frame_ranges = prepare_ctr_gcn_input(data_df, ordered_joints, eval_cfg)
                         if len(streamA_list) == 0:
                             continue
                         X_streamA = torch.stack(streamA_list, dim=0).to(GLOBAL_CONFIG["device"])
                         X_streamB = torch.stack(streamB_list, dim=0).to(GLOBAL_CONFIG["device"])
+
                     else:
                         coords_list, delta_list, bone_list, bone_delta_list, frame_ranges = prepare_ctr_gcn_input(data_df, ordered_joints, eval_cfg)
                         if len(coords_list) == 0:
                             continue
-                        X_coords = torch.stack(coords_list, dim=0).to(GLOBAL_CONFIG["device"])
-                        X_delta = torch.stack(delta_list, dim=0).to(GLOBAL_CONFIG["device"])
-                        X_bone = torch.stack(bone_list, dim=0).to(GLOBAL_CONFIG["device"])
+                        X_coords     = torch.stack(coords_list, dim=0).to(GLOBAL_CONFIG["device"])
+                        X_delta      = torch.stack(delta_list, dim=0).to(GLOBAL_CONFIG["device"])
+                        X_bone       = torch.stack(bone_list, dim=0).to(GLOBAL_CONFIG["device"])
                         X_bone_delta = torch.stack(bone_delta_list, dim=0).to(GLOBAL_CONFIG["device"])
 
+                    # Map frame indices
                     frame_values = meta_df.video_frame.values
                     frame_to_idx = {f: i for i, f in enumerate(frame_values)}
                     actions_available = [a for a in actions_te if a in model_eval[switch]]
                     if not actions_available:
                         continue
+
                     sum_probs = np.zeros((len(frame_values), len(actions_available)), dtype=np.float32)
-                    counts = np.zeros((len(frame_values), len(actions_available)), dtype=np.float32)
+                    counts    = np.zeros((len(frame_values), len(actions_available)), dtype=np.float32)
 
                     for action_idx, action_name in enumerate(actions_available):
                         model = model_eval[switch][action_name]
@@ -2146,7 +2137,9 @@ if RUN_MODE == "validate":
                                 logits = model(X_streamA, X_streamB).squeeze(-1)
                             else:
                                 logits = model(X_coords, X_delta, X_bone, X_bone_delta).squeeze(-1)
+
                         probs = torch.sigmoid(logits).cpu().numpy()
+
                         for w_idx, frames in enumerate(frame_ranges):
                             for t, f in enumerate(frames):
                                 fi = frame_to_idx.get(f)
@@ -2158,29 +2151,33 @@ if RUN_MODE == "validate":
 
                     counts[counts == 0] = 1.0
                     pred_array = sum_probs / counts
+
                     pred_df = pd.DataFrame(pred_array, index=meta_df.video_frame, columns=actions_available)
                     thresh = getattr(eval_cfg, "decision_threshold", 0.27)
+
                     submission_part = predict_multiclass(pred_df, meta_df, threshold=thresh)
                     submissions_local.append(submission_part)
 
+                # Combine all predictions
                 if submissions_local:
                     submission_df = pd.concat(submissions_local, ignore_index=True)
                 else:
-                    submission_df = pd.DataFrame(columns=["video_id", "agent_id", "target_id", "action", "start_frame", "stop_frame"])
+                    submission_df = pd.DataFrame(columns=[
+                        "video_id", "agent_id", "target_id",
+                        "action", "start_frame", "stop_frame"
+                    ])
 
                 solution_df = create_solution_df(val_part)
                 if len(submission_df) == 0:
-                    print(f"[VALIDATE] No predicted events on holdout for {bp_slug} - skipping scoring.")
-                else:
-                    holdout_f1 = score(solution_df, submission_df, row_id_column_name="", beta=1)
-                    best_holdout_f1 = holdout_f1
-                    best_holdout_models = model_eval
-                    print(f"[VALIDATE] Holdout F1 for {bp_slug}: {holdout_f1:.4f}")
+                    print(f"[VALIDATE] No predicted events on 20% split for {bp_slug}.")
             else:
-                print(f"[VALIDATE] No training batches for holdout split in {bp_slug}.")
-        else:
-            print(f"[VALIDATE] Not enough videos for holdout split (found {len(unique_vids)}) for {bp_slug}.")
+                holdout_f1 = score(solution_df, submission_df, row_id_column_name="", beta=1)
+                best_holdout_f1 = holdout_f1
+                best_holdout_models = model_eval
+                print(f"[VALIDATE] Holdout F1 (20% split) for {bp_slug}: {holdout_f1:.4f}")
 
+        else:
+            print(f"[VALIDATE] Not enough videos for split in {bp_slug}.")
         batches = []
         for switch, data_df, meta_df, label_df in generate_mouse_data(train_subset, "train", generate_single=True, generate_pair=True, config=cfg):
             batches.append((switch, data_df, meta_df, label_df))
