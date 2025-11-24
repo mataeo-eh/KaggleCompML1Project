@@ -38,11 +38,13 @@ GLOBAL_CONFIG = {
         "dropout": [0.05, 0.1, 0.2, 0.3],
         "learning_rate": [1e-3, 5e-4, 1e-4],
         "alpha_class_balance": [0.5, 1.0, 1.5],
+        "decision_threshold" : [0.1, 0.2, 0.25, 0.30, 0.35, 0.40, 0.45],
     },
 }
 
 cwd = Path.cwd()
 verbose = True
+
 
 
 # ======================
@@ -78,7 +80,9 @@ class CTRGCNConfig:
     num_blocks: int = 3
     dropout: float = 0.1
     lr: float = 1e-3
+    decision_threshold: float = 0.27
     alpha_balance: float | None = None
+    decision_threshold: float | None = 0.2
 
 
 # ======================
@@ -236,7 +240,18 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
         # Commented out for testing to see if this is affecting GCN skeleton creation
         pvid = vid.pivot(columns=["mouse_id", "bodypart"], index="video_frame", values=["x", "y"])
         if pvid.isna().any().any():
-            if verbose and traintest == "test":
+            print("there were body parts not found - pvid had NaN values")
+
+            # Identify missing body parts
+            missing_mask = pvid.isna().any(axis=0)   # True for columns that contain any NaN
+            missing_cols = pvid.columns[missing_mask]
+
+            print("Missing/misaligned columns (mouse_id, bodypart, coord):")
+            for col in missing_cols:
+                mouse_id, bodypart, coord = col  # because MultiIndex: (mouse_id, bodypart, x/y)
+                print(f" - mouse {mouse_id}: {bodypart} ({coord})")
+
+            if traintest == "test":
                 print("video with missing values", video_id, traintest, len(vid), "frames")
         del vid
         pvid = pvid.reorder_levels([1, 2, 0], axis=1).T.sort_index().T
@@ -277,7 +292,7 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
                         }
                     )
                     if traintest == "train":
-                        single_mouse_label = pd.DataFrame(0.0, columns=vid_agent_actions, index=single_mouse.index)
+                        single_mouse_label = pd.DataFrame(np.nan, columns=vid_agent_actions, index=single_mouse.index)
                         annot_subset = annot.query("(agent_id == @mouse_id) & (target_id == @mouse_id)")
                         for i in range(len(annot_subset)):
                             annot_row = annot_subset.iloc[i]
@@ -310,7 +325,7 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
                         }
                     )
                     if traintest == "train":
-                        mouse_pair_label = pd.DataFrame(0.0, columns=vid_agent_actions, index=mouse_pair.index)
+                        mouse_pair_label = pd.DataFrame(np.nan, columns=vid_agent_actions, index=mouse_pair.index)
                         annot_subset = annot.query("(agent_id == @agent) & (target_id == @target)")
                         for i in range(len(annot_subset)):
                             annot_row = annot_subset.iloc[i]
@@ -804,7 +819,8 @@ def compute_validation_f1_from_windows(windows_tuple, y_dict: dict[str, list], a
         valid = mask_val.cpu().numpy()
         probs = probs[valid]
         y_val = y_val[valid]
-        preds = (probs > 0.5).astype(int)
+        thresh = getattr(config, "decision_threshold", 0.5)
+        preds = (probs > thresh).astype(int)
         if (preds.sum() + y_val.sum()) == 0:
             f1 = 0.0
         else:
@@ -966,8 +982,7 @@ def train_ctr_gcn_models(batches, ordered_joints, adjacency, config: CTRGCNConfi
 # ======================
 # MULTICLASS PREDICTION (FRAME->EVENT)
 # ======================
-def predict_multiclass(pred, meta):
-    threshold = 0.27
+def predict_multiclass(pred, meta, threshold: float = 0.27):
     ama = np.argmax(pred, axis=1)
     ama = np.where(pred.max(axis=1) >= threshold, ama, -1)
     ama = pd.Series(ama, index=meta.video_frame)
@@ -1156,7 +1171,8 @@ def submit_ctr_gcn(body_parts_tracked_str: str, switch_tr: str, model_dict: dict
         pred_array = sum_probs / counts
         pred_array = median_filter(pred_array, size=(5, 1))
         pred_df = pd.DataFrame(pred_array, index=meta_te.video_frame, columns=actions_available)
-        submission_part = predict_multiclass(pred_df, meta_te)
+        thresh = getattr(config, "decision_threshold", 0.27)
+        submission_part = predict_multiclass(pred_df, meta_te, threshold=thresh)
         submissions.append(submission_part)
 
     if len(submissions) == 0:
@@ -1192,7 +1208,7 @@ if RUN_MODE == "tune":
         results_path = os.path.join("tuning_results", f"tuning_results_{stream_mode}_{bp_slug}.csv")
         with open(results_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["trial", "window", "stride", "base_channels", "num_blocks", "dropout", "lr", "alpha_balance", "mean_f1", "timestamp"])
+            writer.writerow(["trial", "window", "stride", "base_channels", "num_blocks", "dropout", "lr", "alpha_balance", "decision_threshold", "mean_f1", "timestamp"])
 
         best_f1 = -1
         best_params = None
@@ -1205,6 +1221,7 @@ if RUN_MODE == "tune":
             dropout = random.choice(param_space["dropout"])
             lr = random.choice(param_space["learning_rate"])
             alpha_balance = random.choice(param_space["alpha_class_balance"])
+            decision_threshold = random.choice(param_space["decision_threshold"])
 
             cfg = CTRGCNConfig(mode="validate", max_videos=num_videos, use_delta=True, use_bone=True, use_bone_delta=True, stream_mode=stream_mode)
             cfg.window = window
@@ -1214,6 +1231,7 @@ if RUN_MODE == "tune":
             cfg.dropout = dropout
             cfg.lr = lr
             cfg.alpha_balance = alpha_balance
+            cfg.decision_threshold = decision_threshold
             cfg.max_batches = None
             cfg.max_windows = None
 
@@ -1228,7 +1246,7 @@ if RUN_MODE == "tune":
 
             with open(results_path, "a", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow([trial, window, stride, base_channels, num_blocks, dropout, lr, alpha_balance, mean_f1, time.time()])
+                writer.writerow([trial, window, stride, base_channels, num_blocks, dropout, lr, alpha_balance, decision_threshold, mean_f1, time.time()])
 
             if mean_f1 > best_f1:
                 best_f1 = mean_f1
@@ -1240,6 +1258,7 @@ if RUN_MODE == "tune":
                     "dropout": dropout,
                     "lr": lr,
                     "alpha_balance": alpha_balance,
+                    "decision_threshold": decision_threshold,
                     "stream_mode": cfg.stream_mode,
                 }
                 model_dir = get_stream_model_dir(cfg, bp_slug=bp_slug)
@@ -1280,18 +1299,19 @@ if RUN_MODE == "tune_grid":
                 param_space["dropout"],
                 param_space["learning_rate"],
                 param_space["alpha_class_balance"],
+                param_space["decision_threshold"],
             )
         )
         tag = stream_mode
         grid_results_path = os.path.join("grid_results", f"grid_results_{tag}_{bp_slug}.csv")
         with open(grid_results_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["idx", "window", "stride", "base_channels", "num_blocks", "dropout", "lr", "alpha_balance", "mean_f1"])
+            writer.writerow(["idx", "window", "stride", "base_channels", "num_blocks", "dropout", "lr", "alpha_balance", "decision_threshold", "mean_f1"])
 
         best_f1 = -1.0
         best_params = None
         for idx, combo in enumerate(grid, start=1):
-            window, stride, base_channels, num_blocks, dropout, lr, alpha_balance = combo
+            window, stride, base_channels, num_blocks, dropout, lr, alpha_balance, decision_threshold = combo
             cfg = CTRGCNConfig(mode="validate", max_videos=None, use_delta=True, use_bone=True, use_bone_delta=True, stream_mode=stream_mode)
             cfg.window = window
             cfg.stride = stride
@@ -1300,6 +1320,7 @@ if RUN_MODE == "tune_grid":
             cfg.dropout = dropout
             cfg.lr = lr
             cfg.alpha_balance = alpha_balance
+            cfg.decision_threshold = decision_threshold
             cfg.max_batches = None
             cfg.max_windows = None
 
@@ -1314,7 +1335,7 @@ if RUN_MODE == "tune_grid":
 
             with open(grid_results_path, "a", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow([idx, window, stride, base_channels, num_blocks, dropout, lr, alpha_balance, mean_f1])
+                writer.writerow([idx, window, stride, base_channels, num_blocks, dropout, lr, alpha_balance, decision_threshold, mean_f1])
 
             if mean_f1 > best_f1:
                 best_f1 = mean_f1
@@ -1326,6 +1347,7 @@ if RUN_MODE == "tune_grid":
                     "dropout": dropout,
                     "lr": lr,
                     "alpha_balance": alpha_balance,
+                    "decision_threshold": decision_threshold,
                     "stream_mode": cfg.stream_mode,
                 }
 
@@ -1718,7 +1740,8 @@ if RUN_MODE == "dev":
             counts[counts == 0] = 1.0
             pred_array = sum_probs / counts
             pred_df = pd.DataFrame(pred_array, index=meta_df.video_frame, columns=actions_available)
-            submission_part = predict_multiclass(pred_df, meta_df)
+            thresh = getattr(dev_config, "decision_threshold", 0.27)
+            submission_part = predict_multiclass(pred_df, meta_df, threshold=thresh)
             submissions_local.append(submission_part)
 
         if submissions_local:
