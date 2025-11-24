@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import os
 import json
 import time
@@ -10,13 +9,15 @@ import re
 from typing import Any
 from dataclasses import dataclass
 from pathlib import Path
-
+import time
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from scipy.ndimage import median_filter
 
+
+start_time = time.time()
 # ======================
 # CONFIGURATION
 # ======================
@@ -99,12 +100,13 @@ def slugify_bodyparts(bp_str: str) -> str:
 
 
 def get_stream_model_dir(cfg: CTRGCNConfig, bp_slug: str | None = None) -> str:
-    root = "CTR-GCN-Models"
+    root = "./CTR-GCN-Models"
     tag = get_stream_mode_tag(cfg)
     sub = {"one": "one_stream", "two": "two_stream", "four": "four_stream"}[tag]
     if bp_slug is None:
         bp_slug = "all_parts"
-    path = os.path.join(root, sub, bp_slug)
+    bp_slug_len = str(len(bp_slug.split("_")))
+    path = os.path.join(root, sub, bp_slug_len)
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -209,12 +211,16 @@ drop_body_parts = [
 ]
 
 
+def filter_tracked_body_parts(body_parts_tracked: list[str]) -> list[str]:
+    """Remove known noisy/dropped body parts to align with available tracking columns."""
+    return [bp for bp in body_parts_tracked if bp not in drop_body_parts]
+
+
 def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_single=True, generate_pair=True, config: CTRGCNConfig | None = None):
     assert traintest in ["train", "test"]
     if traintest_directory is None:
-        traintest_directory = f"/kaggle/input/MABe-mouse-behavior-detection/{traintest}_tracking"
-    # REMOVE AFTER DEBUGGING IS FINISHED
-    print(f"f{str(traintest_directory)}")
+        #traintest_directory = f"/kaggle/input/MABe-mouse-behavior-detection/{traintest}_tracking"
+        traintest_directory = f"./Data/{traintest}_tracking"
     video_count = 0
     batch_count = 0
     for _, row in dataset.iterrows():
@@ -227,41 +233,48 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
         video_id = row.video_id
 
         if type(row.behaviors_labeled) != str:
-            if verbose and traintest == "test":
-                print("No labeled behaviors:", lab_id, video_id, row.behaviors_labeled)
+            # We cannot use videos without labeled behaviors
+            print("No labeled behaviors:", lab_id, video_id, row.behaviors_labeled)
             continue
 
         path = f"{traintest_directory}/{lab_id}/{video_id}.parquet"
-        # REMOVE AFTER FINISHED DEBUGGING
-        print(path)
         vid = pd.read_parquet(path)
-        # if len(np.unique(vid.bodypart)) > 5:
-        #     vid = vid.query("~ bodypart.isin(@drop_body_parts)")
-        # Commented out for testing to see if this is affecting GCN skeleton creation
+        
+        if len(np.unique(vid.bodypart)) > 5:
+            vid = vid.query("~ bodypart.isin(@drop_body_parts)")
+        #Commented out for testing to see if this is affecting GCN skeleton creation
         pvid = vid.pivot(columns=["mouse_id", "bodypart"], index="video_frame", values=["x", "y"])
         if pvid.isna().any().any():
+            # Compute missing ratio per joint
+            missing_info = []
+            skip_video = False
+            for col in pvid.columns:
+                missing_ratio = pvid[col].isna().mean()
+                if missing_ratio >= 0.5:
+                    skip_video = True
+                missing_info.append((col, missing_ratio))
             print("there were body parts not found - pvid had NaN values")
-
-            # Identify missing body parts
-            missing_mask = pvid.isna().any(axis=0)   # True for columns that contain any NaN
-            missing_cols = pvid.columns[missing_mask]
-
-            print("Missing/misaligned columns (mouse_id, bodypart, coord):")
-            for col in missing_cols:
-                mouse_id, bodypart, coord = col  # because MultiIndex: (mouse_id, bodypart, x/y)
-                print(f" - mouse {mouse_id}: {bodypart} ({coord})")
-
-            if traintest == "test":
-                print("video with missing values", video_id, traintest, len(vid), "frames")
+            for (mouse_id, bodypart, coord), ratio in missing_info:
+                if ratio >= 0.5:
+                    print(f" - {coord} for mouse {mouse_id} ({bodypart}) missing {ratio:.2%} -> video discarded")
+                else:
+                    print(f" - {coord} for mouse {mouse_id} ({bodypart}) missing {ratio:.2%}")
+            if skip_video:
+                # discard this video entirely
+                del vid
+                continue
+            # interpolate remaining NaNs
+            pvid = pvid.interpolate(method="linear", axis=0)
+            pvid = pvid.ffill().bfill()
         del vid
-        pvid = pvid.reorder_levels([1, 2, 0], axis=1).T.sort_index().T
+        pvid = pvid.reorder_levels([1, 2, 0], axis=1).T.sort_index().T # mouse_id, body_part, xy
         pvid /= row.pix_per_cm_approx
+        # safety: no NaNs after interpolation
+        assert not pvid.isna().any().any()
 
         behaviors_entries = json.loads(row.behaviors_labeled)
         behaviors_entries = sorted(list({b.replace("'", "") for b in behaviors_entries}))
         vid_behaviors = [b.split(",") for b in behaviors_entries]
-        # REMOVE AFTER FINISHED DEBUGGING 
-        print(f"{vid_behaviors}")
         vid_behaviors = pd.DataFrame(vid_behaviors, columns=["agent", "target", "action"])
         vid_behavior_actions = extract_actions_from_behaviors_labeled(row.behaviors_labeled)
 
@@ -306,36 +319,38 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
                     pass
 
         if generate_pair:
-            vid_behaviors_subset = vid_behaviors.query("target != 'self'")
-            if len(vid_behaviors_subset) > 0:
-                for agent, target in itertools.permutations(np.unique(pvid.columns.get_level_values("mouse_id")), 2):
-                    if config is not None and config.max_batches is not None and batch_count >= config.max_batches:
-                        return
-                    agent_str = f"mouse{agent}"
-                    target_str = f"mouse{target}"
-                    vid_agent_actions = np.unique(vid_behaviors_subset.query("(agent == @agent_str) & (target == @target_str)").action)
-                    mouse_pair = pd.concat([pvid[agent], pvid[target]], axis=1, keys=["A", "B"])
-                    assert len(mouse_pair) == len(pvid)
-                    mouse_pair_meta = pd.DataFrame(
-                        {
-                            "video_id": video_id,
-                            "agent_id": agent_str,
-                            "target_id": target_str,
-                            "video_frame": mouse_pair.index,
-                        }
-                    )
-                    if traintest == "train":
-                        mouse_pair_label = pd.DataFrame(np.nan, columns=vid_agent_actions, index=mouse_pair.index)
-                        annot_subset = annot.query("(agent_id == @agent) & (target_id == @target)")
-                        for i in range(len(annot_subset)):
-                            annot_row = annot_subset.iloc[i]
-                            mouse_pair_label.loc[annot_row["start_frame"] : annot_row["stop_frame"], annot_row.action] = 1.0
-                        yield "pair", mouse_pair, mouse_pair_meta, mouse_pair_label
-                        batch_count += 1
-                    else:
-                        yield "pair", mouse_pair, mouse_pair_meta, vid_agent_actions
-                        batch_count += 1
-
+            try:
+                vid_behaviors_subset = vid_behaviors.query("target != 'self'")
+                if len(vid_behaviors_subset) > 0:
+                    for agent, target in itertools.permutations(np.unique(pvid.columns.get_level_values("mouse_id")), 2):
+                        if config is not None and config.max_batches is not None and batch_count >= config.max_batches:
+                            return
+                        agent_str = f"mouse{agent}"
+                        target_str = f"mouse{target}"
+                        vid_agent_actions = np.unique(vid_behaviors_subset.query("(agent == @agent_str) & (target == @target_str)").action)
+                        mouse_pair = pd.concat([pvid[agent], pvid[target]], axis=1, keys=["A", "B"])
+                        assert len(mouse_pair) == len(pvid)
+                        mouse_pair_meta = pd.DataFrame(
+                            {
+                                "video_id": video_id,
+                                "agent_id": agent_str,
+                                "target_id": target_str,
+                                "video_frame": mouse_pair.index,
+                            }
+                        )
+                        if traintest == "train":
+                            mouse_pair_label = pd.DataFrame(np.nan, columns=vid_agent_actions, index=mouse_pair.index)
+                            annot_subset = annot.query("(agent_id == @agent) & (target_id == @target)")
+                            for i in range(len(annot_subset)):
+                                annot_row = annot_subset.iloc[i]
+                                mouse_pair_label.loc[annot_row["start_frame"] : annot_row["stop_frame"], annot_row.action] = 1.0
+                            yield "pair", mouse_pair, mouse_pair_meta, mouse_pair_label
+                            batch_count += 1
+                        else:
+                            yield "pair", mouse_pair, mouse_pair_meta, vid_agent_actions
+                            batch_count += 1
+            except KeyError:
+                pass
 
 # ======================
 # SLIDING WINDOWS
@@ -474,6 +489,8 @@ def prepare_ctr_gcn_input(single_mouse_df, ordered_joints, config: CTRGCNConfig 
     V = len(ordered_joints)
     frame_ranges = []
     window_count = 0
+    missing_joint_counts: dict[tuple, int] = {}
+    all_nan_windows = 0
 
     streamA_tensors: list[torch.Tensor] = []
     streamB_tensors: list[torch.Tensor] = []
@@ -492,11 +509,25 @@ def prepare_ctr_gcn_input(single_mouse_df, ordered_joints, config: CTRGCNConfig 
         window_np = np.full((2, V, window_len), np.nan, dtype=np.float32)
         for j, bp in enumerate(ordered_joints):
             try:
-                coords = window_df[bp]
+                coords = window_df.loc[:, (bp, 'x')]
                 window_np[0, j, :] = coords["x"].to_numpy(dtype=np.float32, copy=False)
+                coords = window_df.loc[:, (bp, 'y')]
                 window_np[1, j, :] = coords["y"].to_numpy(dtype=np.float32, copy=False)
             except KeyError:
                 continue
+
+        # Debug: identify joints with no data in this window and skip the window if everything is missing
+        missing_joint_mask = np.isnan(window_np).all(axis=(0, 2))
+        if missing_joint_mask.any():
+            missing_joints = [ordered_joints[idx] for idx in np.where(missing_joint_mask)[0]]
+            missing_joint_counts.setdefault(tuple(missing_joints), 0)
+            missing_joint_counts[tuple(missing_joints)] += 1
+            # If all joints are missing, drop the window entirely
+            if missing_joint_mask.sum() == V:
+                continue
+        if np.isnan(window_np).all():
+            all_nan_windows += 1
+            continue
 
         bone = np.zeros_like(window_np)
         for j in range(V - 1):
@@ -558,6 +589,16 @@ def prepare_ctr_gcn_input(single_mouse_df, ordered_joints, config: CTRGCNConfig 
         frame_ranges.append(frame_indices)
         window_count += 1
 
+    if verbose:
+        for joints, count in missing_joint_counts.items():
+            joint_list = list(joints)
+            snippet = joint_list if len(joint_list) <= 5 else joint_list[:5] + ["..."]
+            print(
+                f"[prepare_ctr_gcn_input] Window had missing joints ({len(joint_list)}): {snippet} occurred {count} times"
+            )
+        if all_nan_windows > 0:
+            print(f"[prepare_ctr_gcn_input] Skipped {all_nan_windows} windows because all coordinates were NaN.")
+
     if mode == "one":
         if len(window_tensors) == 0:
             return torch.empty((0, config.in_channels_single_stream, V, window_len)), frame_ranges
@@ -615,6 +656,7 @@ def collect_ctr_gcn_windows(batches, ordered_joints, config: CTRGCNConfig):
                 batch_count += 1
                 continue
 
+        # Ensure action lists exist only for actions present in this label_df
         for action in label_df.columns:
             if switch == "single":
                 if action not in y_dict_single:
@@ -654,7 +696,8 @@ def collect_ctr_gcn_windows(batches, ordered_joints, config: CTRGCNConfig):
                     bone_delta_windows_pair.append(bone_delta_list[i])
                     frame_ranges_pair.append(frame_range)
             target_dict = y_dict_single if switch == "single" else y_dict_pair
-            for action in target_dict.keys():
+            actions_present = [a for a in target_dict.keys() if a in label_df.columns]
+            for action in actions_present:
                 window_labels = label_df[action].reindex(frame_range).to_numpy(dtype=np.float32)
                 target_dict[action].append(window_labels)
 
@@ -734,7 +777,19 @@ def compute_validation_f1_from_windows(windows_tuple, y_dict: dict[str, list], a
             X_action_bone = X_bone
             X_action_bone_delta = X_bone_delta
 
-        n_samples = y_action.shape[0]
+        if mode == "one":
+            x_len = X_action.shape[0]
+        elif mode == "two":
+            x_len = X_action_A.shape[0]
+        else:
+            x_len = X_action_coords.shape[0]
+        n_samples = min(y_action.shape[0], x_len)
+        if n_samples <= 1:
+            continue
+        if n_samples != y_action.shape[0] and verbose:
+            print(f"[compute_validation_f1_from_windows] Mismatch between labels ({y_action.shape[0]}) and windows ({x_len}); using {n_samples}")
+        y_action = y_action[:n_samples]
+        mask = mask[:n_samples]
         perm = rng.permutation(n_samples)
         split_idx = max(1, int(0.8 * n_samples))
         if split_idx >= n_samples:
@@ -907,6 +962,7 @@ def train_ctr_gcn_models(batches, ordered_joints, adjacency, config: CTRGCNConfi
 
             if mode == "one":
                 X_action = X
+                x_len = X_action.shape[0]
                 model = CTRGCNMinimal(
                     in_channels=config.in_channels_single_stream,
                     num_classes=1,
@@ -918,6 +974,7 @@ def train_ctr_gcn_models(batches, ordered_joints, adjacency, config: CTRGCNConfi
             elif mode == "two":
                 X_action_A = X_streamA
                 X_action_B = X_streamB
+                x_len = min(X_action_A.shape[0], X_action_B.shape[0])
                 model = CTRGCNTwoStream(
                     adjacency=adjacency,
                     in_channels_coords=config.in_channels_streamA,
@@ -931,6 +988,12 @@ def train_ctr_gcn_models(batches, ordered_joints, adjacency, config: CTRGCNConfi
                 X_action_delta = X_delta
                 X_action_bone = X_bone
                 X_action_bone_delta = X_bone_delta
+                x_len = min(
+                    X_action_coords.shape[0],
+                    X_action_delta.shape[0],
+                    X_action_bone.shape[0],
+                    X_action_bone_delta.shape[0],
+                )
                 model = CTRGCNFourStream(
                     adjacency=adjacency,
                     base_channels=base_channels,
@@ -945,10 +1008,19 @@ def train_ctr_gcn_models(batches, ordered_joints, adjacency, config: CTRGCNConfi
             else:
                 criterion = torch.nn.BCEWithLogitsLoss()
 
+            # Align sample counts between labels and windows
+            n_samples = min(y_action.shape[0], x_len)
+            if n_samples == 0:
+                continue
+            if n_samples != y_action.shape[0] and verbose:
+                print(f"[train_ctr_gcn_models] Mismatch between labels ({y_action.shape[0]}) and windows ({x_len}) for action {action}; using {n_samples}")
+            y_action = y_action[:n_samples]
+            mask = mask[:n_samples]
+
             for _ in range(epochs):
                 model.train()
-                for start in range(0, len(y_action), batch_size):
-                    end = start + batch_size
+                for start in range(0, n_samples, batch_size):
+                    end = min(start + batch_size, n_samples)
                     batch_y = y_action[start:end]
                     batch_mask = mask[start:end]
                     if mode == "one":
@@ -1031,7 +1103,7 @@ def load_ctr_gcn_models(model_dir: str | None, actions: list[str], adjacency: np
     if device == "cuda" and not torch.cuda.is_available():
         device = "cpu"
 
-    print(f"Training CTR-GCN using device: {device}")
+    print(f"Loading CTR-GCN using device: {device}")
 
     model_dict: dict[str, nn.Module] = {}
 
@@ -1102,7 +1174,7 @@ def submit_ctr_gcn(body_parts_tracked_str: str, switch_tr: str, model_dict: dict
             if hasattr(config, key):
                 setattr(config, key, value)
 
-    body_parts_tracked = json.loads(body_parts_tracked_str)
+    body_parts_tracked = filter_tracked_body_parts(json.loads(body_parts_tracked_str))
     if RUN_MODE == "submit":
         test_subset = test[test.body_parts_tracked == body_parts_tracked_str]
         generator = generate_mouse_data(test_subset, "test", generate_single=True, generate_pair=True, config=config)
@@ -1204,7 +1276,7 @@ if RUN_MODE == "tune":
             continue
         bp_slug = slugify_bodyparts(bp_str)
         train_subset = train_subset_full.sample(n=min(num_videos, len(train_subset_full)), random_state=42)
-        ordered_joints, adjacency = get_ordered_joints_and_adjacency(json.loads(bp_str))
+        ordered_joints, adjacency = get_ordered_joints_and_adjacency(filter_tracked_body_parts(json.loads(bp_str)))
         results_path = os.path.join("tuning_results", f"tuning_results_{stream_mode}_{bp_slug}.csv")
         with open(results_path, "w", newline="") as f:
             writer = csv.writer(f)
@@ -1289,7 +1361,7 @@ if RUN_MODE == "tune_grid":
         if len(train_subset) == 0:
             continue
         bp_slug = slugify_bodyparts(bp_str)
-        ordered_joints, adjacency = get_ordered_joints_and_adjacency(json.loads(bp_str))
+        ordered_joints, adjacency = get_ordered_joints_and_adjacency(filter_tracked_body_parts(json.loads(bp_str)))
         grid = list(
             itertools.product(
                 param_space["window"],
@@ -1384,7 +1456,7 @@ if RUN_MODE == "validate":
         else:
             print(f"No best_params file found for stream_mode {cfg.stream_mode} body parts {bp_slug} - using defaults.")
 
-        ordered_joints, adjacency = get_ordered_joints_and_adjacency(json.loads(bp_str))
+        ordered_joints, adjacency = get_ordered_joints_and_adjacency(filter_tracked_body_parts(json.loads(bp_str)))
         batches = []
         for switch, data_df, meta_df, label_df in generate_mouse_data(train_subset, "train", generate_single=True, generate_pair=True, config=cfg):
             batches.append((switch, data_df, meta_df, label_df))
@@ -1636,131 +1708,144 @@ if RUN_MODE == "dev":
     device = torch.device("cuda" if torch.cuda.is_available() else GLOBAL_CONFIG.get("device", "cpu"))
     print(f"Using device for dev check: {device}")
 
-    if len(body_parts_tracked_list) < 2:
-        print("Not enough body-part sets for dev check.")
+    if len(body_parts_tracked_list) == 0:
+        print("No body-part sets found for dev check.")
     else:
-        bp_str = body_parts_tracked_list[1]
-        bp_slug = slugify_bodyparts(bp_str)
-        body_parts_tracked = json.loads(bp_str)
-        ordered_joints, adjacency = get_ordered_joints_and_adjacency(body_parts_tracked)
-        print(f"Model is tracking {body_parts_tracked}")
+        total_sets = len(body_parts_tracked_list)
+        for bp_idx, bp_str in enumerate(body_parts_tracked_list):
+            bp_slug = slugify_bodyparts(bp_str)
+            body_parts_tracked = filter_tracked_body_parts(json.loads(bp_str))
+            ordered_joints, adjacency = get_ordered_joints_and_adjacency(body_parts_tracked)
+            print(f"\n[DEV] Body-part set {bp_idx + 1}/{total_sets}: {bp_slug}")
+            print(f"[DEV] Tracking {body_parts_tracked}")
 
-        bp_rows = train[train.body_parts_tracked == bp_str]
-        unique_vids = bp_rows.video_id.unique()
-        train_vids = unique_vids[:30]
-        test_vids = unique_vids[30:100]
-        train_subset = bp_rows[bp_rows.video_id.isin(train_vids)]
-        test_subset = bp_rows[bp_rows.video_id.isin(test_vids)]
+            bp_rows = train[train.body_parts_tracked == bp_str]
+            unique_vids = bp_rows.video_id.unique()
+            #if len(unique_vids) < 10:
+             #   print(f"[DEV] Not enough videos for 5 train / 5 test (found {len(unique_vids)}) - skipping {bp_slug}.")
+              #  continue
+            train_vids = unique_vids[:5]
+            test_vids = unique_vids[5:10]
+            train_subset = bp_rows[bp_rows.video_id.isin(train_vids)]
+            test_subset = bp_rows[bp_rows.video_id.isin(test_vids)]
 
-        dev_config = CTRGCNConfig(
-            mode="dev",
-            max_videos=5,
-            max_batches=20,
-            max_windows=300,
-            show_progress=True,
-            stream_mode=GLOBAL_CONFIG.get("stream_mode", "one"),
-        )
+            dev_config = CTRGCNConfig(
+                mode="dev",
+                max_videos=None,  # limit handled by slicing above
+                max_batches=20,
+                max_windows=500,
+                show_progress=True,
+                stream_mode=GLOBAL_CONFIG.get("stream_mode", "one"),
+            )
 
-        # Train models on first 5 videos (single + pair)
-        train_batches: list = []
-        for switch, data_df, meta_df, label_df in generate_mouse_data(
-            train_subset,
-            "train",
-            traintest_directory=traintest_directory_path,
-            generate_single=True,
-            generate_pair=True,
-            config=dev_config,
-        ):
-            train_batches.append((switch, data_df, meta_df, label_df))
+            # Train models on first 5 videos (single + pair)
+            train_batches: list = []
+            for switch, data_df, meta_df, label_df in generate_mouse_data(
+                train_subset,
+                "train",
+                traintest_directory=traintest_directory_path,
+                generate_single=True,
+                generate_pair=True,
+                config=dev_config,
+            ):
+                train_batches.append((switch, data_df, meta_df, label_df))
 
-        model_dict_all = train_ctr_gcn_models(train_batches, ordered_joints, adjacency, dev_config, device=device)
-
-        # Inference on next 5 videos
-        submissions_local: list[pd.DataFrame] = []
-        for switch, data_df, meta_df, label_df in generate_mouse_data(
-            test_subset,
-            "train",
-            traintest_directory=traintest_directory_path,
-            generate_single=True,
-            generate_pair=True,
-            config=dev_config,
-        ):
-            actions_te = list(label_df.columns)
-            mode = getattr(dev_config, "stream_mode", "one")
-            if mode == "one":
-                window_tensor, frame_ranges = prepare_ctr_gcn_input(data_df, ordered_joints, dev_config)
-                if window_tensor.shape[0] == 0:
-                    continue
-                X = window_tensor.to(device)
-            elif mode == "two":
-                streamA_list, streamB_list, frame_ranges = prepare_ctr_gcn_input(data_df, ordered_joints, dev_config)
-                if len(streamA_list) == 0:
-                    continue
-                X_streamA = torch.stack(streamA_list, dim=0).to(device)
-                X_streamB = torch.stack(streamB_list, dim=0).to(device)
-            else:
-                coords_list, delta_list, bone_list, bone_delta_list, frame_ranges = prepare_ctr_gcn_input(data_df, ordered_joints, dev_config)
-                if len(coords_list) == 0:
-                    continue
-                X_coords = torch.stack(coords_list, dim=0).to(device)
-                X_delta = torch.stack(delta_list, dim=0).to(device)
-                X_bone = torch.stack(bone_list, dim=0).to(device)
-                X_bone_delta = torch.stack(bone_delta_list, dim=0).to(device)
-
-            frame_values = meta_df.video_frame.values
-            frame_to_idx = {f: i for i, f in enumerate(frame_values)}
-            n_frames = len(frame_values)
-            n_actions = len(actions_te)
-            sum_probs = np.zeros((n_frames, n_actions), dtype=np.float32)
-            counts = np.zeros((n_frames, n_actions), dtype=np.float32)
-
-            actions_available = [a for a in actions_te if a in model_dict_all[switch]]
-            if not actions_available:
+            if len(train_batches) == 0:
+                print(f"[DEV] No training batches generated for {bp_slug} - skipping.")
                 continue
 
-            for action_idx, action_name in enumerate(actions_available):
-                model = model_dict_all[switch][action_name]
-                with torch.no_grad():
-                    if mode == "one":
-                        logits = model(X).squeeze(-1)
-                    elif mode == "two":
-                        logits = model(X_streamA, X_streamB).squeeze(-1)
-                    else:
-                        logits = model(X_coords, X_delta, X_bone, X_bone_delta).squeeze(-1)
-                probs = torch.sigmoid(logits).cpu().numpy()
-                for w_idx, frames in enumerate(frame_ranges):
-                    for t, f in enumerate(frames):
-                        fi = frame_to_idx.get(f)
-                        if fi is None or t >= probs.shape[1]:
-                            continue
-                        p = float(probs[w_idx, t])
-                        sum_probs[fi, action_idx] += p
-                        counts[fi, action_idx] += 1.0
+            model_dict_all = train_ctr_gcn_models(train_batches, ordered_joints, adjacency, dev_config, device=device)
 
-            counts[counts == 0] = 1.0
-            pred_array = sum_probs / counts
-            pred_df = pd.DataFrame(pred_array, index=meta_df.video_frame, columns=actions_available)
-            thresh = getattr(dev_config, "decision_threshold", 0.27)
-            submission_part = predict_multiclass(pred_df, meta_df, threshold=thresh)
-            submissions_local.append(submission_part)
+            # Inference on next 5 videos
+            submissions_local: list[pd.DataFrame] = []
+            for switch, data_df, meta_df, label_df in generate_mouse_data(
+                test_subset,
+                "train",
+                traintest_directory=traintest_directory_path,
+                generate_single=True,
+                generate_pair=True,
+                config=dev_config,
+            ):
+                actions_te = list(label_df.columns)
+                mode = getattr(dev_config, "stream_mode", "one")
+                if mode == "one":
+                    window_tensor, frame_ranges = prepare_ctr_gcn_input(data_df, ordered_joints, dev_config)
+                    if window_tensor.shape[0] == 0:
+                        continue
+                    X = window_tensor.to(device)
+                elif mode == "two":
+                    streamA_list, streamB_list, frame_ranges = prepare_ctr_gcn_input(data_df, ordered_joints, dev_config)
+                    if len(streamA_list) == 0:
+                        continue
+                    X_streamA = torch.stack(streamA_list, dim=0).to(device)
+                    X_streamB = torch.stack(streamB_list, dim=0).to(device)
+                else:
+                    coords_list, delta_list, bone_list, bone_delta_list, frame_ranges = prepare_ctr_gcn_input(data_df, ordered_joints, dev_config)
+                    if len(coords_list) == 0:
+                        continue
+                    X_coords = torch.stack(coords_list, dim=0).to(device)
+                    X_delta = torch.stack(delta_list, dim=0).to(device)
+                    X_bone = torch.stack(bone_list, dim=0).to(device)
+                    X_bone_delta = torch.stack(bone_delta_list, dim=0).to(device)
 
-        if submissions_local:
-            submission_df = pd.concat(submissions_local, ignore_index=True)
-        else:
-            submission_df = pd.DataFrame(columns=["video_id", "agent_id", "target_id", "action", "start_frame", "stop_frame"])
+                frame_values = meta_df.video_frame.values
+                frame_to_idx = {f: i for i, f in enumerate(frame_values)}
+                n_frames = len(frame_values)
+                n_actions = len(actions_te)
+                sum_probs = np.zeros((n_frames, n_actions), dtype=np.float32)
+                counts = np.zeros((n_frames, n_actions), dtype=np.float32)
 
-        # Build solution for the dev test subset
-        solution_df = create_solution_df(test_subset)
-        f1_val = 0.0
-        if len(submission_df) == 0:  # Prevent no actions found crashing program
-            print("[DEV] No predicted events - skipping scoring.")
-        else:
-            f1_val = score(solution_df, submission_df, row_id_column_name="", beta=1)
-            print("DEV F1 =", f1_val)
+                actions_available = [a for a in actions_te if a in model_dict_all[switch]]
+                if not actions_available:
+                    continue
 
-        print("\nDEV SUMMARY")
-        print(f"Body parts set: {bp_slug}")
-        print(f"Train videos: {len(train_vids)}, Test videos: {len(test_vids)}")
-        actions_trained = len(model_dict_all['single']) + len(model_dict_all['pair'])
-        print(f"Number of actions trained (single+pair): {actions_trained}")
-        print(f"Validation F1 (mouse_fbeta-style): {f1_val:.4f}")
+                for action_idx, action_name in enumerate(actions_available):
+                    model = model_dict_all[switch][action_name]
+                    with torch.no_grad():
+                        if mode == "one":
+                            logits = model(X).squeeze(-1)
+                        elif mode == "two":
+                            logits = model(X_streamA, X_streamB).squeeze(-1)
+                        else:
+                            logits = model(X_coords, X_delta, X_bone, X_bone_delta).squeeze(-1)
+                    probs = torch.sigmoid(logits).cpu().numpy()
+                    for w_idx, frames in enumerate(frame_ranges):
+                        for t, f in enumerate(frames):
+                            fi = frame_to_idx.get(f)
+                            if fi is None or t >= probs.shape[1]:
+                                continue
+                            p = float(probs[w_idx, t])
+                            sum_probs[fi, action_idx] += p
+                            counts[fi, action_idx] += 1.0
+
+                counts[counts == 0] = 1.0
+                pred_array = sum_probs / counts
+                pred_df = pd.DataFrame(pred_array, index=meta_df.video_frame, columns=actions_available)
+                thresh = getattr(dev_config, "decision_threshold", 0.27)
+                submission_part = predict_multiclass(pred_df, meta_df, threshold=thresh)
+                submissions_local.append(submission_part)
+
+            if submissions_local:
+                submission_df = pd.concat(submissions_local, ignore_index=True)
+            else:
+                submission_df = pd.DataFrame(columns=["video_id", "agent_id", "target_id", "action", "start_frame", "stop_frame"])
+
+            # Build solution for the dev test subset
+            solution_df = create_solution_df(test_subset)
+            f1_val = 0.0
+            if len(submission_df) == 0:  # Prevent no actions found crashing program
+                print("[DEV] No predicted events - skipping scoring.")
+            else:
+                f1_val = score(solution_df, submission_df, row_id_column_name="", beta=1)
+                print("DEV F1 =", f1_val)
+
+            print("\nDEV SUMMARY")
+            print(f"Body parts set: {bp_slug}")
+            print(f"Train videos: {len(train_vids)}, Test videos: {len(test_vids)}")
+            actions_trained = len(model_dict_all['single']) + len(model_dict_all['pair'])
+            print(f"Actions trained (single+pair): {actions_trained}")
+            print(f"Validation F1 (mouse_fbeta-style): {f1_val:.4f}")
+
+end_time = time.time()
+elapsed = end_time - start_time
+print(f"Execution time: {elapsed:.4f} seconds")
