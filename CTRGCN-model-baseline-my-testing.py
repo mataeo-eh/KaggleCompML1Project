@@ -305,12 +305,6 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
                 if missing_ratio >= 0.5:
                     skip_video = True
                 missing_info.append((col, missing_ratio))
-            print("there were body parts not found - pvid had NaN values")
-            for (mouse_id, bodypart, coord), ratio in missing_info:
-                if ratio >= 0.5:
-                    print(f" - {coord} for mouse {mouse_id} ({bodypart}) missing {ratio:.2%} -> video discarded")
-                else:
-                    print(f" - {coord} for mouse {mouse_id} ({bodypart}) missing {ratio:.2%}")
             if skip_video:
                 # discard this video entirely
                 del vid
@@ -615,10 +609,6 @@ def prepare_ctr_gcn_input(single_mouse_df, ordered_joints, config: CTRGCNConfig 
     missing_joint_counts: dict[tuple, int] = {}
     all_nan_windows = 0
     missing_bp_columns: dict[str, int] = {}
-    if verbose:
-        print(f"[prepare_ctr_gcn_input] mode={mode}, V={V}, window={window_len}, stride={stride}")
-        print(f"[prepare_ctr_gcn_input] ordered_joints (first 10): {ordered_joints[:10]}")
-        print(f"[prepare_ctr_gcn_input] incoming columns (first 10): {list(single_mouse_df.columns)[:10]}")
 
     streamA_tensors: list[torch.Tensor] = []
     streamB_tensors: list[torch.Tensor] = []
@@ -722,22 +712,7 @@ def prepare_ctr_gcn_input(single_mouse_df, ordered_joints, config: CTRGCNConfig 
         window_count += 1
 
     if verbose:
-        for joints, count in missing_joint_counts.items():
-            joint_list = list(joints)
-            if joint_list == ["__all_missing__"]:
-                print(f"[prepare_ctr_gcn_input] Windows dropped because all requested joints were missing: {count} times")
-                continue
-            snippet = joint_list if len(joint_list) <= 5 else joint_list[:5] + ["..."]
-            print(
-                f"[prepare_ctr_gcn_input] Window had missing joints ({len(joint_list)}): {snippet} occurred {count} times"
-            )
-        if all_nan_windows > 0:
-            print(f"[prepare_ctr_gcn_input] Skipped {all_nan_windows} windows because all coordinates were NaN.")
-        print(f"[prepare_ctr_gcn_input] windows created: {window_count}")
-        if missing_bp_columns:
-            print("[prepare_ctr_gcn_input] Missing bodypart columns counts:")
-            for bp, cnt in missing_bp_columns.items():
-                print(f" - {bp}: {cnt} windows")
+        pass
 
     if mode == "one":
         if len(window_tensors) == 0:
@@ -755,7 +730,7 @@ def collect_ctr_gcn_windows(batches, ordered_joints, config: CTRGCNConfig):
     mode = getattr(config, "stream_mode", "one")
     window_len = getattr(config, "window", 90)
     if verbose:
-        print(f"[collect_ctr_gcn_windows] mode={mode}, window={window_len}, V={len(ordered_joints)}")
+        pass
 
     X_windows_single: list[torch.Tensor] = []
     streamA_windows_single: list[torch.Tensor] = []

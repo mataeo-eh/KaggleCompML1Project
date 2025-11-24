@@ -21,7 +21,7 @@ start_time = time.time()
 # ======================
 # CONFIGURATION
 # ======================
-RUN_MODE = "validate"  # one of: dev, validate, submit, tune, tune_grid
+RUN_MODE = "dev"  # one of: dev, validate, submit, tune, tune_grid
 STREAM_MODE = "one"  # one of: "one", "two", "four"
 traintest_directory_path = "./Data/train_tracking" # The path for dev testing the code with competition data
 
@@ -99,7 +99,7 @@ def slugify_bodyparts(bp_str: str) -> str:
 
 
 def get_stream_model_dir(cfg: CTRGCNConfig, bp_slug: str | None = None) -> str:
-    root = "./CTR-GCN-Models"
+    root = "./CTR-GCN-Models3.0"
     tag = get_stream_mode_tag(cfg)
     sub = {"one": "one_stream", "two": "two_stream", "four": "four_stream"}[tag]
     if bp_slug is None:
@@ -305,12 +305,6 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
                 if missing_ratio >= 0.5:
                     skip_video = True
                 missing_info.append((col, missing_ratio))
-            print("there were body parts not found - pvid had NaN values")
-            for (mouse_id, bodypart, coord), ratio in missing_info:
-                if ratio >= 0.5:
-                    print(f" - {coord} for mouse {mouse_id} ({bodypart}) missing {ratio:.2%} -> video discarded")
-                else:
-                    print(f" - {coord} for mouse {mouse_id} ({bodypart}) missing {ratio:.2%}")
             if skip_video:
                 # discard this video entirely
                 del vid
@@ -433,85 +427,98 @@ def _normalize_adjacency_chain(adjacency: np.ndarray) -> np.ndarray:
     return A / row_sum
 
 class DynamicAdjacency(nn.Module):
+    """
+    SOTA CTR-GCN dynamic adjacency:
+       A_dyn = softmax( (theta(x)^T phi(x)) / sqrt(C) )
+       g(x) projected back to original channels.
+    """
     def __init__(self, in_channels, reduction_ratio=8):
         super().__init__()
         hidden = max(in_channels // reduction_ratio, 16)
 
-        self.theta = nn.Conv2d(in_channels, hidden, 1)
-        self.phi   = nn.Conv2d(in_channels, hidden, 1)
-        self.g     = nn.Conv2d(in_channels, hidden, 1)
+        self.theta = nn.Conv2d(in_channels, hidden, 1, bias=False)
+        self.phi   = nn.Conv2d(in_channels, hidden, 1, bias=False)
+        self.g     = nn.Conv2d(in_channels, hidden, 1, bias=False)
 
-        self.out_proj = nn.Conv2d(hidden, in_channels, 1)
+        self.out_proj = nn.Conv2d(hidden, in_channels, 1, bias=False)
 
-    def forward(self, x):  
+    def forward(self, x):
         # x: (N, C, V, T)
-        theta = self.theta(x).mean(-1)  # (N, hidden, V)
-        phi   = self.phi(x).mean(-1)    # (N, hidden, V)
+        theta = self.theta(x).mean(-1)   # (N, hidden, V)
+        phi   = self.phi(x).mean(-1)     # (N, hidden, V)
+        g_x   = self.g(x).mean(-1)       # (N, hidden, V)
 
-        att = torch.matmul(theta.transpose(2,1), phi)  # (N, V, V)
-        att = torch.softmax(att, dim=-1)               # softmax-row normalized
+        att = torch.matmul(theta.transpose(2,1), phi) / (theta.shape[1] ** 0.5)
+        att = torch.softmax(att, dim=-1)              # (N, V, V)
 
-        return att
+        # Apply dynamic adjacency to g(x)
+        dyn = torch.matmul(g_x, att.transpose(2,1))   # (N, hidden, V)
+        dyn = dyn.unsqueeze(-1)                       # (N, hidden, V, 1)
+        dyn = self.out_proj(dyn)                      # back to C channels
+        return dyn
+
     
 class CTRGraphConv(nn.Module):
+    """
+    Three-branch spatial graph conv from CTR-GCN:
+       static branch
+       dynamic adjacency branch
+       pointwise (local) branch
+    """
     def __init__(self, in_channels, out_channels, adjacency):
         super().__init__()
         A_norm = _normalize_adjacency_chain(adjacency)
         self.register_buffer("A", torch.from_numpy(A_norm))
 
-        # Static branch
-        self.conv_static = nn.Conv2d(in_channels, out_channels, 1)
+        self.conv_static   = nn.Conv2d(in_channels, out_channels, 1, bias=False)
+        self.conv_dynamic  = nn.Conv2d(in_channels, out_channels, 1, bias=False)
+        self.conv_point    = nn.Conv2d(in_channels, out_channels, 1, bias=False)
 
-        # Learnable adjacency branch (dynamic)
         self.dynamic_adj = DynamicAdjacency(in_channels)
-        self.conv_dynamic = nn.Conv2d(in_channels, out_channels, 1)
 
-        # Pointwise branch (local mixing)
-        self.conv_pointwise = nn.Conv2d(in_channels, out_channels, 1)
+        self.bn = nn.BatchNorm2d(out_channels)
 
     def forward(self, x):
-        # --- 1. Static spatial graph ---
+        # ----- Static adjacency -----
         static = torch.einsum("ncvT,vw->ncwT", x, self.A)
         static = self.conv_static(static)
 
-        # --- 2. Dynamic learned adjacency ---
-        dyn_A = self.dynamic_adj(x)  # (N, V, V)
-        dyn   = torch.einsum("ncvT,nvw->ncwT", x, dyn_A)
-        dyn   = self.conv_dynamic(dyn)
+        # ----- Dynamic adjacency -----
+        dyn_feat = self.dynamic_adj(x)             # (N, C, V, 1)
+        dyn_feat = dyn_feat.repeat(1, 1, 1, x.size(-1))  # broadcast T
+        dyn      = self.conv_dynamic(dyn_feat)
 
-        # --- 3. Pointwise feature mixing ---
-        pw = self.conv_pointwise(x)
+        # ----- Pointwise feature mixing -----
+        pw = self.conv_point(x)
 
-        return static + dyn + pw
+        out = static + dyn + pw
+        return self.bn(out)
+
 
 
 class STBlock(nn.Module):
     def __init__(self, in_channels, out_channels, adjacency,
-                 stride=1, dropout=0.1, kernel_size=9):
+                 stride=1, dropout=0.2, kernel_size=9):
         super().__init__()
 
         self.gcn = CTRGraphConv(in_channels, out_channels, adjacency)
 
         pad = (kernel_size - 1) // 2
-
         self.tcn = nn.Sequential(
-            nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(
-                out_channels,
-                out_channels,
-                kernel_size=(1, kernel_size),
-                padding=(0, pad),
-                stride=(1, stride),
-                bias=False,
-            ),
+            nn.Conv2d(out_channels, out_channels,
+                      kernel_size=(1, kernel_size),
+                      stride=(1, stride),
+                      padding=(0, pad),
+                      bias=False),
             nn.BatchNorm2d(out_channels),
             nn.Dropout(dropout),
         )
 
-        if (in_channels != out_channels) or (stride != 1):
+        if in_channels != out_channels or stride != 1:
             self.residual = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=(1, stride), bias=False),
+                nn.Conv2d(in_channels, out_channels, kernel_size=1,
+                          stride=(1, stride), bias=False),
                 nn.BatchNorm2d(out_channels),
             )
         else:
@@ -524,53 +531,56 @@ class STBlock(nn.Module):
         x = self.gcn(x)
         x = self.tcn(x)
         x = x + res
-        x = self.relu(x)
-        return x
+        return self.relu(x)
 
 
 
-class CTRGCNMinimal(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        num_classes: int,
-        adjacency: np.ndarray,
-        channels = [64]*4 + [96]*4 + [128]*4,
-        dropout: float = 0.1,
-    ):
+
+class CTRGCNMedium(nn.Module):
+    """
+    SOTA-style CTR-GCN backbone (12 blocks):
+    - 4 blocks @ 64
+    - 4 blocks @ 128
+    - 4 blocks @ 256
+    - Temporal kernels: 9 for first 8 blocks, 5 for last 4
+    """
+    def __init__(self,
+                 in_channels: int,
+                 num_classes: int,
+                 adjacency: np.ndarray,
+                 dropout: float = 0.2):
         super().__init__()
 
-        # channels is now a tuple or list defining progressive expansion
-        assert len(channels) >= 1
+        channels = [64]*4 + [128]*4 + [256]*4
+        kernels  = [9]*8 + [5]*4
+
         blocks = []
         last_c = in_channels
 
-        for out_c in channels:
-            blocks.append(STBlock(last_c, out_c, adjacency, stride=1, dropout=dropout))
+        for out_c, k in zip(channels, kernels):
+            blocks.append(STBlock(last_c, out_c, adjacency,
+                                  stride=1, dropout=dropout, kernel_size=k))
             last_c = out_c
 
         self.st_blocks = nn.ModuleList(blocks)
-
-        # classifier automatically adapts to last channel
         self.fc = nn.Linear(last_c, num_classes)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (N, C, V, T)
-        out = x
-        for block in self.st_blocks:
-            out = block(out)
+    def forward(self, x):
+        # (N, C_in, V, T)
+        for blk in self.st_blocks:
+            x = blk(x)
 
-        out = out.mean(dim=-2)         # (N, C_out, T)
-        out = out.permute(0, 2, 1)     # (N, T, C_out)
-        logits = self.fc(out)          # (N, T, num_classes)
-        return logits
+        x = x.mean(dim=-2)       # (N, C, T)
+        x = x.permute(0, 2, 1)   # (N, T, C)
+        return self.fc(x)
+
 
 
 class CTRGCNTwoStream(nn.Module):
     def __init__(self, adjacency: np.ndarray, in_channels_coords: int = 2, in_channels_delta: int = 2, base_channels: int = 64, num_blocks: int = 3, dropout: float = 0.1):
         super().__init__()
-        self.stream_coords = CTRGCNMinimal(in_channels_coords, base_channels, adjacency, base_channels, num_blocks, dropout)
-        self.stream_delta = CTRGCNMinimal(in_channels_delta, base_channels, adjacency, base_channels, num_blocks, dropout)
+        self.stream_coords = CTRGCNMedium(in_channels_coords, base_channels, adjacency, base_channels, num_blocks, dropout)
+        self.stream_delta = CTRGCNMedium(in_channels_delta, base_channels, adjacency, base_channels, num_blocks, dropout)
         self.fc = nn.Linear(base_channels, 1)
 
     def forward(self, coords_x: torch.Tensor, delta_x: torch.Tensor) -> torch.Tensor:
@@ -584,10 +594,10 @@ class CTRGCNTwoStream(nn.Module):
 class CTRGCNFourStream(nn.Module):
     def __init__(self, adjacency, base_channels=64, dropout=0.1, num_blocks=3):
         super().__init__()
-        self.stream_coords = CTRGCNMinimal(2, base_channels, adjacency, base_channels, num_blocks, dropout)
-        self.stream_delta = CTRGCNMinimal(2, base_channels, adjacency, base_channels, num_blocks, dropout)
-        self.stream_bone = CTRGCNMinimal(2, base_channels, adjacency, base_channels, num_blocks, dropout)
-        self.stream_bone_delta = CTRGCNMinimal(2, base_channels, adjacency, base_channels, num_blocks, dropout)
+        self.stream_coords = CTRGCNMedium(2, base_channels, adjacency, base_channels, num_blocks, dropout)
+        self.stream_delta = CTRGCNMedium(2, base_channels, adjacency, base_channels, num_blocks, dropout)
+        self.stream_bone = CTRGCNMedium(2, base_channels, adjacency, base_channels, num_blocks, dropout)
+        self.stream_bone_delta = CTRGCNMedium(2, base_channels, adjacency, base_channels, num_blocks, dropout)
         self.fc = nn.Linear(base_channels, 1)
 
     def forward(self, coords_x, delta_x, bone_x, bone_delta_x):
@@ -615,10 +625,6 @@ def prepare_ctr_gcn_input(single_mouse_df, ordered_joints, config: CTRGCNConfig 
     missing_joint_counts: dict[tuple, int] = {}
     all_nan_windows = 0
     missing_bp_columns: dict[str, int] = {}
-    if verbose:
-        print(f"[prepare_ctr_gcn_input] mode={mode}, V={V}, window={window_len}, stride={stride}")
-        print(f"[prepare_ctr_gcn_input] ordered_joints (first 10): {ordered_joints[:10]}")
-        print(f"[prepare_ctr_gcn_input] incoming columns (first 10): {list(single_mouse_df.columns)[:10]}")
 
     streamA_tensors: list[torch.Tensor] = []
     streamB_tensors: list[torch.Tensor] = []
@@ -722,22 +728,7 @@ def prepare_ctr_gcn_input(single_mouse_df, ordered_joints, config: CTRGCNConfig 
         window_count += 1
 
     if verbose:
-        for joints, count in missing_joint_counts.items():
-            joint_list = list(joints)
-            if joint_list == ["__all_missing__"]:
-                print(f"[prepare_ctr_gcn_input] Windows dropped because all requested joints were missing: {count} times")
-                continue
-            snippet = joint_list if len(joint_list) <= 5 else joint_list[:5] + ["..."]
-            print(
-                f"[prepare_ctr_gcn_input] Window had missing joints ({len(joint_list)}): {snippet} occurred {count} times"
-            )
-        if all_nan_windows > 0:
-            print(f"[prepare_ctr_gcn_input] Skipped {all_nan_windows} windows because all coordinates were NaN.")
-        print(f"[prepare_ctr_gcn_input] windows created: {window_count}")
-        if missing_bp_columns:
-            print("[prepare_ctr_gcn_input] Missing bodypart columns counts:")
-            for bp, cnt in missing_bp_columns.items():
-                print(f" - {bp}: {cnt} windows")
+        pass
 
     if mode == "one":
         if len(window_tensors) == 0:
@@ -755,7 +746,7 @@ def collect_ctr_gcn_windows(batches, ordered_joints, config: CTRGCNConfig):
     mode = getattr(config, "stream_mode", "one")
     window_len = getattr(config, "window", 90)
     if verbose:
-        print(f"[collect_ctr_gcn_windows] mode={mode}, window={window_len}, V={len(ordered_joints)}")
+        pass
 
     X_windows_single: list[torch.Tensor] = []
     streamA_windows_single: list[torch.Tensor] = []
@@ -906,9 +897,9 @@ def compute_validation_f1_from_windows(windows_tuple, y_dict: dict[str, list], a
     if config.mode == "dev":
         epochs = 1
     elif config.mode == "validate":
-        epochs = 3
-    else:
         epochs = 5
+    else:
+        epochs = 7
 
     f1_scores: list[float] = []
     rng = np.random.default_rng(seed)
@@ -952,11 +943,10 @@ def compute_validation_f1_from_windows(windows_tuple, y_dict: dict[str, list], a
         val_idx = perm[split_idx:]
 
         if mode == "one":
-            model = CTRGCNMinimal(
+            model = CTRGCNMedium(
                 in_channels=config.in_channels_single_stream,
                 num_classes=1,
                 adjacency=adjacency,
-                channels= [64]*4 + [96]*4 + [128]*4,
                 dropout=dropout,
             ).to(device)
         elif mode == "two":
@@ -971,7 +961,16 @@ def compute_validation_f1_from_windows(windows_tuple, y_dict: dict[str, list], a
         else:
             model = CTRGCNFourStream(adjacency=adjacency, base_channels=base_channels, dropout=dropout, num_blocks=num_blocks).to(device)
 
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=lr,               
+            weight_decay=1e-4
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=epochs,         # ★ same number of epochs you already loop over
+        eta_min=1e-5
+        )
         if alpha_balance is not None:
             pos_weight = torch.tensor([alpha_balance], device=device)
             criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
@@ -1004,8 +1003,10 @@ def compute_validation_f1_from_windows(windows_tuple, y_dict: dict[str, list], a
                 optimizer.zero_grad()
                 loss = criterion(logits, batch_y)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
-
+                scheduler.step()
+                
         model.eval()
         with torch.no_grad():
             if mode == "one":
@@ -1132,11 +1133,10 @@ def train_ctr_gcn_models(batches, ordered_joints, adjacency, config: CTRGCNConfi
             if mode == "one":
                 X_action = X
                 x_len = X_action.shape[0]
-                model = CTRGCNMinimal(
+                model =CTRGCNMedium(
                     in_channels=config.in_channels_single_stream,
                     num_classes=1,
                     adjacency=adjacency_local,
-                    channels= [64]*4 + [96]*4 + [128]*4,
                     dropout=dropout,
                 ).to(device)
             elif mode == "two":
@@ -1292,11 +1292,10 @@ def load_ctr_gcn_models(model_dir: str | None, actions: list[str], adjacency: np
 
     for action in actions:
         if mode == "one":
-            model = CTRGCNMinimal(
+            model = CTRGCNMedium(
                 in_channels=config.in_channels_single_stream,
                 num_classes=1,
                 adjacency=adjacency_local,
-                channels= [64]*4 + [96]*4 + [128]*4,
                 dropout=dropout,
             )
         elif mode == "two":
