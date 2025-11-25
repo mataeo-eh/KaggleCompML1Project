@@ -40,10 +40,10 @@ GLOBAL_CONFIG = {
         "learning_rate": [0.1, 0.05, 0.01],
         "momentum": [0.8, 0.9],
         "weight_decay": [1e-4, 5e-4],
-        "batch_size": [32, 64],
-        "epochs": [60, 90, 120],
-        "alpha_class_balance": [0.5, 1.0, 1.5],
-        "decision_threshold" : [0.1, 0.2, 0.25, 0.30, 0.35],
+        "batch_size": [16, 32, 64, 128],
+        "epochs": [60, 90, 120, 500, 1000],
+        "alpha_class_balance": [0.25, 0.5, 1.0, 1.5, 2.0],
+        "decision_threshold" : [0.1, 0.2, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50],
         "temporal_kernel_size": [5, 7, 9],
     },
 }
@@ -80,8 +80,8 @@ class CTRGCNConfig:
     in_channels_bone_only: int = 2
     in_channels_bone_delta_only: int = 2
 
-    window: int = 64
-    stride: int = 32
+    window: int = 32
+    stride: int = 15
     base_channels: int = 64
     num_blocks: int = 12
     temporal_kernel_size: int = 9
@@ -92,14 +92,167 @@ class CTRGCNConfig:
     momentum: float = 0.9
     weight_decay: float = 1e-4
     batch_size: int = 64
-    epochs: int = 120
+    epochs: int = 60
     grad_clip: float = 1.0
     alpha_balance: float | None = None
-    decision_threshold: float = 0.2
+    decision_threshold: float = 0.25
     use_random_crop: bool = True
     use_random_rotation: bool = True
     max_rotation_deg: float = 15.0
     crop_jitter_frames: int = 8
+
+
+class WarmupCosineSchedule(torch.optim.lr_scheduler._LRScheduler):
+    def __init__(self, optimizer, warmup_steps, total_steps, eta_min=1e-5, last_epoch=-1):
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.eta_min = eta_min
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        step = self.last_epoch + 1
+        if step < self.warmup_steps:
+            # Linear warmup: lr = base_lr * (step / warmup_steps)
+            scale = float(step) / float(max(1, self.warmup_steps))
+            return [base_lr * scale for base_lr in self.base_lrs]
+
+        # Cosine decay after warmup
+        progress = float(step - self.warmup_steps) / float(max(1, self.total_steps - self.warmup_steps))
+        cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+        return [
+            self.eta_min + (base_lr - self.eta_min) * cosine_decay
+            for base_lr in self.base_lrs
+        ]
+
+import math
+class CTRGraphConv(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, adjacency: np.ndarray, coff_embedding: int = 4, use_ctr: bool = True):
+        super().__init__()
+        A_norm = _normalize_adjacency_chain(adjacency)
+        self.A_base = nn.Parameter(torch.from_numpy(A_norm), requires_grad=True)
+        self.use_ctr = use_ctr
+        inter_channels = max(1, out_channels // coff_embedding)
+        self.theta = nn.Conv2d(out_channels, inter_channels, kernel_size=1)
+        self.phi = nn.Conv2d(out_channels, inter_channels, kernel_size=1)
+        self.alpha = nn.Parameter(torch.zeros(1))
+        self.proj = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=True)
+        self.bn = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x: torch.Tensor, edge_importance: torch.Tensor | None = None) -> torch.Tensor:
+        # x: (N, C_in, V, T)
+        x = self.proj(x)  # (N, C_out, V, T)
+        A_eff = self.A_base
+        if edge_importance is not None:
+            A_eff = A_eff * edge_importance
+
+        if self.use_ctr:
+            theta_x = self.theta(x)  # (N, C_mid, V, T)
+            phi_x = self.phi(x)
+            N, C_mid, V, T = theta_x.shape
+            theta_f = theta_x.mean(-1)        # (N, C_mid, V)
+            phi_f   = phi_x.mean(-1)          # (N, C_mid, V)
+
+            refine = torch.einsum("ncv,ncw->nvw", theta_f, phi_f)
+            refine = refine.mean(0) / math.sqrt(C_mid)
+            refine = torch.tanh(refine)  # (V, V)
+
+            A_eff = A_eff + self.alpha * refine
+
+        x = torch.einsum("ncvt,vw->ncwt", x, A_eff)
+        x = self.bn(x)
+        return x
+
+
+class CTRGCNBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, adjacency: np.ndarray, stride: int = 1, dropout: float = 0.1, temporal_kernel: int = 9, use_ctr: bool = True, edge_importance: bool = True):
+        super().__init__()
+        self.gcn = CTRGraphConv(in_channels, out_channels, adjacency, use_ctr=use_ctr)
+        pad_t = temporal_kernel // 2
+        self.tcn = nn.Sequential(
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=(1, temporal_kernel), padding=(0, pad_t), stride=(1, stride), bias=True),
+            nn.BatchNorm2d(out_channels),
+            nn.Dropout(dropout),
+        )
+        if (in_channels != out_channels) or (stride != 1):
+            self.residual = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=(1, stride), bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+        else:
+            self.residual = nn.Identity()
+        self.relu = nn.ReLU(inplace=True)
+        self.edge_importance = edge_importance
+
+    def forward(self, x: torch.Tensor, edge_importance: torch.Tensor | None = None) -> torch.Tensor:
+        res = self.residual(x)
+        x = self.gcn(x, edge_importance if self.edge_importance else None)
+        x = self.tcn(x)
+        x = x + res
+        x = self.relu(x)
+        return x
+
+
+class CTRGCNBackbone(nn.Module):
+    def __init__(self, in_channels: int, num_classes: int, adjacency: np.ndarray, channels: list[int] | None = None, dropout: float = 0.1, temporal_kernel: int = 9, use_ctr: bool = True, use_edge_importance: bool = True):
+        super().__init__()
+        if channels is None:
+            channels = [64, 64, 64, 64, 96, 96, 96, 96, 128, 128, 128, 128]
+        blocks = []
+        last_c = in_channels
+        self.edge_importance = nn.ParameterList(
+            [nn.Parameter(torch.ones_like(torch.from_numpy(_normalize_adjacency_chain(adjacency))), requires_grad=True) if use_edge_importance else nn.Parameter(torch.ones_like(torch.from_numpy(_normalize_adjacency_chain(adjacency))), requires_grad=False) for _ in channels]
+        )
+        for idx, out_c in enumerate(channels):
+            blocks.append(CTRGCNBlock(last_c, out_c, adjacency, stride=1, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, edge_importance=use_edge_importance))
+            last_c = out_c
+        self.st_blocks = nn.ModuleList(blocks)
+        self.fc = nn.Linear(last_c, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = x
+        for block, imp in zip(self.st_blocks, self.edge_importance):
+            out = block(out, imp)
+        out = out.mean(dim=-2)  # (N, C_out, T)
+        out = out.permute(0, 2, 1)  # (N, T, C_out)
+        logits = self.fc(out)
+        return logits
+
+
+class CTRGCNTwoStream(nn.Module):
+    def __init__(self, adjacency: np.ndarray, in_channels_coords: int = 2, in_channels_delta: int = 2, base_channels: int = 64, num_blocks: int = 12, dropout: float = 0.1, temporal_kernel: int = 9, use_ctr: bool = True, use_edge_importance: bool = True):
+        super().__init__()
+        channels = [base_channels] * num_blocks
+        self.stream_coords = CTRGCNBackbone(in_channels_coords, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
+        self.stream_delta = CTRGCNBackbone(in_channels_delta, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
+        self.fc = nn.Linear(base_channels, 1)
+
+    def forward(self, coords_x: torch.Tensor, delta_x: torch.Tensor) -> torch.Tensor:
+        feat_A = self.stream_coords(coords_x)
+        feat_B = self.stream_delta(delta_x)
+        fused = feat_A + feat_B
+        logits = self.fc(fused)
+        return logits
+
+
+class CTRGCNFourStream(nn.Module):
+    def __init__(self, adjacency, base_channels=64, dropout=0.1, num_blocks=12, temporal_kernel: int = 9, use_ctr: bool = True, use_edge_importance: bool = True):
+        super().__init__()
+        channels = [base_channels] * num_blocks
+        self.stream_coords = CTRGCNBackbone(2, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
+        self.stream_delta = CTRGCNBackbone(2, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
+        self.stream_bone = CTRGCNBackbone(2, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
+        self.stream_bone_delta = CTRGCNBackbone(2, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
+        self.fc = nn.Linear(base_channels, 1)
+
+    def forward(self, coords_x, delta_x, bone_x, bone_delta_x):
+        f1 = self.stream_coords(coords_x)
+        f2 = self.stream_delta(delta_x)
+        f3 = self.stream_bone(bone_x)
+        f4 = self.stream_bone_delta(bone_delta_x)
+        fused = f1 + f2 + f3 + f4
+        return self.fc(fused)
 
 
 # ======================
@@ -311,7 +464,6 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
 
         if len(np.unique(vid.bodypart)) > 5:
             vid = vid.query("~ bodypart.isin(@drop_body_parts)")
-        #Commented out for testing to see if this is affecting GCN skeleton creation
         pvid = vid.pivot(columns=["mouse_id", "bodypart"], index="video_frame", values=["x", "y"])
         if pvid.isna().any().any():
             # Compute missing ratio per joint
@@ -443,136 +595,6 @@ def _normalize_adjacency_chain(adjacency: np.ndarray) -> np.ndarray:
     row_sum[row_sum == 0.0] = 1.0
     return A / row_sum
 
-
-import math
-class CTRGraphConv(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, adjacency: np.ndarray, coff_embedding: int = 4, use_ctr: bool = True):
-        super().__init__()
-        A_norm = _normalize_adjacency_chain(adjacency)
-        self.A_base = nn.Parameter(torch.from_numpy(A_norm), requires_grad=True)
-        self.use_ctr = use_ctr
-        inter_channels = max(1, out_channels // coff_embedding)
-        self.theta = nn.Conv2d(out_channels, inter_channels, kernel_size=1)
-        self.phi = nn.Conv2d(out_channels, inter_channels, kernel_size=1)
-        self.alpha = nn.Parameter(torch.zeros(1))
-        self.proj = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=True)
-        self.bn = nn.BatchNorm2d(out_channels)
-
-    def forward(self, x: torch.Tensor, edge_importance: torch.Tensor | None = None) -> torch.Tensor:
-        # x: (N, C_in, V, T)
-        x = self.proj(x)  # (N, C_out, V, T)
-        A_eff = self.A_base
-        if edge_importance is not None:
-            A_eff = A_eff * edge_importance
-
-        if self.use_ctr:
-            theta_x = self.theta(x)  # (N, C_mid, V, T)
-            phi_x = self.phi(x)
-            N, C_mid, V, T = theta_x.shape
-            theta_f = theta_x.mean(-1)        # (N, C_mid, V)
-            phi_f   = phi_x.mean(-1)          # (N, C_mid, V)
-
-            refine = torch.einsum("ncv,ncw->nvw", theta_f, phi_f)
-            refine = refine.mean(0) / math.sqrt(C_mid)
-            refine = torch.tanh(refine)  # (V, V)
-
-            A_eff = A_eff + self.alpha * refine
-
-        x = torch.einsum("ncvt,vw->ncwt", x, A_eff)
-        x = self.bn(x)
-        return x
-
-
-class CTRGCNBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, adjacency: np.ndarray, stride: int = 1, dropout: float = 0.1, temporal_kernel: int = 9, use_ctr: bool = True, edge_importance: bool = True):
-        super().__init__()
-        self.gcn = CTRGraphConv(in_channels, out_channels, adjacency, use_ctr=use_ctr)
-        pad_t = temporal_kernel // 2
-        self.tcn = nn.Sequential(
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=(1, temporal_kernel), padding=(0, pad_t), stride=(1, stride), bias=True),
-            nn.BatchNorm2d(out_channels),
-            nn.Dropout(dropout),
-        )
-        if (in_channels != out_channels) or (stride != 1):
-            self.residual = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=(1, stride), bias=False),
-                nn.BatchNorm2d(out_channels),
-            )
-        else:
-            self.residual = nn.Identity()
-        self.relu = nn.ReLU(inplace=True)
-        self.edge_importance = edge_importance
-
-    def forward(self, x: torch.Tensor, edge_importance: torch.Tensor | None = None) -> torch.Tensor:
-        res = self.residual(x)
-        x = self.gcn(x, edge_importance if self.edge_importance else None)
-        x = self.tcn(x)
-        x = x + res
-        x = self.relu(x)
-        return x
-
-
-class CTRGCNBackbone(nn.Module):
-    def __init__(self, in_channels: int, num_classes: int, adjacency: np.ndarray, channels: list[int] | None = None, dropout: float = 0.1, temporal_kernel: int = 9, use_ctr: bool = True, use_edge_importance: bool = True):
-        super().__init__()
-        if channels is None:
-            channels = [64, 64, 64, 64, 96, 96, 96, 96, 128, 128, 128, 128]
-        blocks = []
-        last_c = in_channels
-        self.edge_importance = nn.ParameterList(
-            [nn.Parameter(torch.ones_like(torch.from_numpy(_normalize_adjacency_chain(adjacency))), requires_grad=True) if use_edge_importance else nn.Parameter(torch.ones_like(torch.from_numpy(_normalize_adjacency_chain(adjacency))), requires_grad=False) for _ in channels]
-        )
-        for idx, out_c in enumerate(channels):
-            blocks.append(CTRGCNBlock(last_c, out_c, adjacency, stride=1, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, edge_importance=use_edge_importance))
-            last_c = out_c
-        self.st_blocks = nn.ModuleList(blocks)
-        self.fc = nn.Linear(last_c, num_classes)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = x
-        for block, imp in zip(self.st_blocks, self.edge_importance):
-            out = block(out, imp)
-        out = out.mean(dim=-2)  # (N, C_out, T)
-        out = out.permute(0, 2, 1)  # (N, T, C_out)
-        logits = self.fc(out)
-        return logits
-
-
-class CTRGCNTwoStream(nn.Module):
-    def __init__(self, adjacency: np.ndarray, in_channels_coords: int = 2, in_channels_delta: int = 2, base_channels: int = 64, num_blocks: int = 12, dropout: float = 0.1, temporal_kernel: int = 9, use_ctr: bool = True, use_edge_importance: bool = True):
-        super().__init__()
-        channels = [base_channels] * num_blocks
-        self.stream_coords = CTRGCNBackbone(in_channels_coords, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
-        self.stream_delta = CTRGCNBackbone(in_channels_delta, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
-        self.fc = nn.Linear(base_channels, 1)
-
-    def forward(self, coords_x: torch.Tensor, delta_x: torch.Tensor) -> torch.Tensor:
-        feat_A = self.stream_coords(coords_x)
-        feat_B = self.stream_delta(delta_x)
-        fused = feat_A + feat_B
-        logits = self.fc(fused)
-        return logits
-
-
-class CTRGCNFourStream(nn.Module):
-    def __init__(self, adjacency, base_channels=64, dropout=0.1, num_blocks=12, temporal_kernel: int = 9, use_ctr: bool = True, use_edge_importance: bool = True):
-        super().__init__()
-        channels = [base_channels] * num_blocks
-        self.stream_coords = CTRGCNBackbone(2, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
-        self.stream_delta = CTRGCNBackbone(2, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
-        self.stream_bone = CTRGCNBackbone(2, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
-        self.stream_bone_delta = CTRGCNBackbone(2, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
-        self.fc = nn.Linear(base_channels, 1)
-
-    def forward(self, coords_x, delta_x, bone_x, bone_delta_x):
-        f1 = self.stream_coords(coords_x)
-        f2 = self.stream_delta(delta_x)
-        f3 = self.stream_bone(bone_x)
-        f4 = self.stream_bone_delta(bone_delta_x)
-        fused = f1 + f2 + f3 + f4
-        return self.fc(fused)
 
 
 # ======================
@@ -860,17 +882,14 @@ def compute_validation_f1_from_windows(windows_tuple, y_dict: dict[str, list], a
     lr = getattr(config, "lr", 1e-3)
     alpha_balance = getattr(config, "alpha_balance", None)
 
-    if config.mode == "dev":
-        epochs = 1
-    elif config.mode == "validate":
-        epochs = 3
-    else:
-        epochs = 5
+    epochs = getattr(config, "epochs", 2)
 
     f1_scores: list[float] = []
     rng = np.random.default_rng(seed)
 
-    for action, labels in y_dict.items():
+    actions_order = sorted(y_dict.keys())
+    for action in actions_order:
+        labels = y_dict[action]
         y_tensor = torch.tensor(labels, dtype=torch.float32, device=device)  # (N, T)
         mask = ~torch.isnan(y_tensor)
         if mask.sum().item() < 2:
@@ -898,7 +917,7 @@ def compute_validation_f1_from_windows(windows_tuple, y_dict: dict[str, list], a
         if n_samples <= 1:
             continue
         if n_samples != y_action.shape[0] and verbose:
-            print(f"[compute_validation_f1_from_windows] Mismatch between labels ({y_action.shape[0]}) and windows ({x_len}); using {n_samples}")
+            print(f"[compute validation f1 from windows] Mismatch between labels ({y_action.shape[0]}) and windows ({x_len}); using {n_samples}")
         y_action = y_action[:n_samples]
         mask = mask[:n_samples]
         perm = rng.permutation(n_samples)
@@ -1056,6 +1075,7 @@ def train_ctr_gcn_models(batches, ordered_joints, adjacency, config: CTRGCNConfi
         ("single", windows_single, labels_single),
         ("pair", windows_pair, labels_pair),
     ]:
+        actions_order = sorted(y_dict.keys())
         mode, data = streams_tuple
         if mode == "one" and (data is None or data.shape[0] == 0):
             continue
@@ -1081,17 +1101,13 @@ def train_ctr_gcn_models(batches, ordered_joints, adjacency, config: CTRGCNConfi
                 print(f"[train_ctr_gcn_models] switch={switch_name} coords {X_coords.shape}, delta {X_delta.shape}, bone {X_bone.shape}, bone_delta {X_bone_delta.shape}")
 
         batch_size = getattr(config, "batch_size", 16)
-        if config.mode == "dev":
-            epochs = 1
-        elif config.mode == "validate":
-            epochs = 3
-        else:
-            epochs = getattr(config, "epochs", 5)
+        epochs = getattr(config, "epochs", 2)
 
         # Choose adjacency based on switch (single vs pair)
         adjacency_local = adjacency if switch_name == "single" else make_pair_adjacency(adjacency)
 
-        for action, labels in y_dict.items():
+        for action in actions_order:
+            labels = y_dict.get(action, [])
             labels_np = np.asarray(labels, dtype=np.float32)   # (N, T)
             y_tensor = torch.from_numpy(labels_np).to(device)  # (N, T)
 
@@ -1102,7 +1118,7 @@ def train_ctr_gcn_models(batches, ordered_joints, adjacency, config: CTRGCNConfi
 
             total_pos = torch.nan_to_num(y_action, nan=0.0).sum().item()
             if verbose:
-                print(f"[train] action={action}, windows={y_action.shape[0]}, frames={y_action.shape[1]}, positives={total_pos}")
+                print(f"[train] action={action}, windows={y_action.shape[0]}, frames={y_action.shape[1]}, positives predicted={total_pos}")
 
 
 
@@ -1157,15 +1173,7 @@ def train_ctr_gcn_models(batches, ordered_joints, adjacency, config: CTRGCNConfi
                     temporal_kernel=temporal_kernel,
                     use_ctr=use_ctr,
                     use_edge_importance=use_edge_importance,
-                ).to(device)
-
-            optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=getattr(config, "momentum", 0.9), weight_decay=getattr(config, "weight_decay", 1e-4))
-            if alpha_balance is not None:
-                pos_weight = torch.tensor([alpha_balance], device=device)
-                criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-            else:
-                criterion = torch.nn.BCEWithLogitsLoss()
-
+                    ).to(device)
             # Align sample counts between labels and windows
             n_samples = min(y_action.shape[0], x_len)
             if n_samples == 0:
@@ -1174,35 +1182,106 @@ def train_ctr_gcn_models(batches, ordered_joints, adjacency, config: CTRGCNConfi
                 print(f"[train_ctr_gcn_models] Mismatch between labels ({y_action.shape[0]}) and windows ({x_len}) for action {action}; using {n_samples}")
             y_action = y_action[:n_samples]
             mask = mask[:n_samples]
+            
+            # -----------------------
+            # Compute n_samples FIRST
+            # -----------------------
+            n_samples = min(y_action.shape[0], x_len)
+            if n_samples == 0:
+                continue
 
-            for _ in range(epochs):
+            y_action = y_action[:n_samples]
+            mask = mask[:n_samples]
+
+            # Build shuffled index array
+            train_idx = np.arange(n_samples)
+
+            # -----------------------
+            # Optimizer
+            # -----------------------
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=lr,
+                weight_decay=getattr(config, "weight_decay", 1e-4)
+            )
+
+            # -----------------------
+            # Warmup + Cosine schedule
+            # -----------------------
+            total_steps = epochs * math.ceil(n_samples / batch_size)
+            warmup_steps = max(10, int(0.1 * total_steps))
+
+            scheduler = WarmupCosineSchedule(
+                optimizer,
+                warmup_steps=warmup_steps,
+                total_steps=total_steps,
+                eta_min=1e-5
+            )
+            # -----------------------
+
+            # Loss
+            if alpha_balance is not None:
+                pos_weight = torch.tensor([alpha_balance], device=device)
+                criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            else:
+                criterion = torch.nn.BCEWithLogitsLoss()
+
+
+            learning_rate_updates = 0
+
+            # -----------------------
+            # TRAINING LOOP
+            # -----------------------
+            for epoch in (tqdm(range(epochs), desc="training epochs") if config.show_progress else range(epochs)):
+
                 model.train()
+
+                # IMPORTANT: shuffle each epoch
+                np.random.shuffle(train_idx)
+
                 for start in range(0, n_samples, batch_size):
                     end = min(start + batch_size, n_samples)
-                    batch_y = y_action[start:end]
-                    batch_mask = mask[start:end]
+                    batch_ids = train_idx[start:end]
+
+                    batch_y = y_action[batch_ids]
+                    batch_mask = mask[batch_ids]
+
+                    # Forward pass
                     if mode == "one":
-                        logits = model(X_action[start:end]).squeeze(-1)
+                        logits = model(X_action[batch_ids]).squeeze(-1)
                     elif mode == "two":
-                        logits = model(X_action_A[start:end], X_action_B[start:end]).squeeze(-1)
+                        logits = model(X_action_A[batch_ids], X_action_B[batch_ids]).squeeze(-1)
                     else:
                         logits = model(
-                            X_action_coords[start:end],
-                            X_action_delta[start:end],
-                            X_action_bone[start:end],
-                            X_action_bone_delta[start:end],
+                            X_action_coords[batch_ids],
+                            X_action_delta[batch_ids],
+                            X_action_bone[batch_ids],
+                            X_action_bone_delta[batch_ids],
                         ).squeeze(-1)
-                    if batch_mask.sum().item() == 0:
+
+                    valid = batch_mask
+                    if valid.sum().item() == 0:
                         continue
-                    logits = logits[batch_mask]
-                    batch_y_masked = batch_y[batch_mask]
+
+                    logits = logits[valid]
+                    batch_y_valid = batch_y[valid]
+
                     optimizer.zero_grad()
-                    loss = criterion(logits, batch_y_masked)
+                    loss = criterion(logits, batch_y_valid)
                     loss.backward()
-                    clip_val = getattr(config, "grad_clip", None)
-                    if clip_val is not None:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), clip_val)
+
+                    torch.nn.utils.clip_grad_norm_(model.parameters(),
+                                                max_norm=getattr(config, "grad_clip", 1.0))
+
                     optimizer.step()
+                    scheduler.step()
+                    learning_rate_updates += 1
+
+            if verbose:
+                print(f"[train_ctr_gcn_models] Action '{action}' ")
+                print(f"({switch_name}-stream) — optimizer steps: {learning_rate_updates}")
+
+
 
             if switch_name == "single":
                 model_dict_single[action] = model
@@ -1215,7 +1294,7 @@ def train_ctr_gcn_models(batches, ordered_joints, adjacency, config: CTRGCNConfi
 # ======================
 # MULTICLASS PREDICTION (FRAME->EVENT)
 # ======================
-def predict_multiclass(pred, meta, threshold: float = 0.27):
+def predict_multiclass(pred, meta, threshold: float = CTRGCNConfig.decision_threshold):
     ama = np.argmax(pred, axis=1)
     ama = np.where(pred.max(axis=1) >= threshold, ama, -1)
     ama = pd.Series(ama, index=meta.video_frame)
@@ -1246,7 +1325,7 @@ def predict_multiclass(pred, meta, threshold: float = 0.27):
             submission_part.iat[i, submission_part.columns.get_loc("stop_frame")] = new_stop_frame
     assert (submission_part.stop_frame > submission_part.start_frame).all(), "stop <= start"
     if verbose:
-        print("  actions found:", len(submission_part))
+        print("  number of action sequences predicted:", len(submission_part))
     return submission_part
 
 
@@ -1443,7 +1522,7 @@ train = pd.read_csv(cwd / "Data" / "train.csv")
 train["n_mice"] = 4 - train[["mouse1_strain", "mouse2_strain", "mouse3_strain", "mouse4_strain"]].isna().sum(axis=1)
 train_without_mabe22 = train.query("~ lab_id.str.startswith('MABe22_')")
 test = pd.read_csv(cwd / "Data" / "test.csv")
-body_parts_tracked_list = sorted(train.body_parts_tracked.unique())
+body_parts_tracked_list = sorted(train_without_mabe22.body_parts_tracked.unique())
 
 if RUN_MODE == "tune":
     print("Running CTR-GCN random-search hyperparameter tuning...")
@@ -1878,13 +1957,14 @@ if RUN_MODE == "dev":
     print("\n========== DEV MODE SANITY CHECK ==========\n")
     device = torch.device("cuda" if torch.cuda.is_available() else GLOBAL_CONFIG.get("device", "cpu"))
     print(f"Using device for dev check: {device}")
-
     if len(body_parts_tracked_list) == 0:
         print("No body-part sets found for dev check.")
     else:
         total_sets = len(body_parts_tracked_list)
-        dev_f1_scores: list[float] = []
-        for bp_idx, bp_str in enumerate(body_parts_tracked_list):
+        dev_f1_df = pd.DataFrame(columns=["F1 Score"])
+        pbar = tqdm(body_parts_tracked_list)
+        for bp_idx, bp_str in enumerate(pbar):
+            pbar.set_description(f"Processing Body-part set {bp_idx + 1}/{total_sets}")
             bp_slug = slugify_bodyparts(bp_str)
             body_parts_tracked = filter_tracked_body_parts(json.loads(bp_str))
             ordered_joints, adjacency = get_ordered_joints_and_adjacency(body_parts_tracked)
@@ -1905,11 +1985,15 @@ if RUN_MODE == "dev":
                 mode="dev",
                 max_videos=None,  # limit handled by slicing above
                 max_batches=20,
-                max_windows=100,
-                window=64,
-                stride=32,
+                max_windows=500,
+                window=30,
+                stride=15,
                 show_progress=True,
                 stream_mode=GLOBAL_CONFIG.get("stream_mode", "one"),
+                decision_threshold = 0.15,
+                epochs = 2,
+                batch_size = 8,
+                weight_decay = 0,
             )
 
             # Train models on first 5 videos (single + pair)
@@ -2022,12 +2106,24 @@ if RUN_MODE == "dev":
             print(f"Train videos: {len(train_vids)}, Test videos: {len(test_vids)}")
             actions_trained = len(model_dict_all['single']) + len(model_dict_all['pair'])
             print(f"Actions trained (single+pair): {actions_trained}")
-            print(f"Validation F1 (mouse_fbeta-style): {f1_val:.4f}")
-            dev_f1_scores.append(f1_val)
+            print(f"Validation F1 (mouse_fbeta-style): {f1_val:.4f} \n")
+            dev_f1_df.loc[len(dev_f1_df)] = f1_val
 
-        if dev_f1_scores:
-            overall_f1 = sum(dev_f1_scores) / len(dev_f1_scores)
+
+        if not dev_f1_df.empty:
+            overall_f1 = dev_f1_df["F1 Score"].mean()
+            dev_f1_df.loc["Overall F1 Score"] = overall_f1
             print(f"\n[DEV] Average holdout F1 across body-part sets: {overall_f1:.4f}")
+            csv_path = Path("dev_f1_scores-CTRGCN-baseline.csv")
+            # If file exists → load and append
+            if csv_path.exists():
+                existing_df = pd.read_csv(csv_path, index_col=0)
+                combined_df = pd.concat([existing_df, dev_f1_df])
+            else:
+                combined_df = dev_f1_df
+
+            # Save back to CSV
+            combined_df.to_csv(csv_path, index=True)
 
 if RUN_MODE == "validate":
     for bp_str in body_parts_tracked_list:

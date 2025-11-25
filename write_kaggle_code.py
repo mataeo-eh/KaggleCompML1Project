@@ -82,3 +82,22 @@ for section in range(1, len(body_parts_tracked_list)): # skip index 0 (MABe22)
                 print(f" - mouse id = {mouse_id}: missing \nBodypart = {bodypart} \ncoord=({coord})")
 
 '''
+from pprint import pprint
+
+train = pd.read_csv(cwd / "Data" / "train.csv")
+train["n_mice"] = 4 - train[["mouse1_strain", "mouse2_strain", "mouse3_strain", "mouse4_strain"]].isna().sum(axis=1)
+train_without_mabe22 = train.query("~ lab_id.str.startswith('MABe22_')")
+test = pd.read_csv(cwd / "Data" / "test.csv")
+body_parts_tracked_list = sorted(train.body_parts_tracked.unique())
+
+print("\nBody parts tracked and file counts:\n")
+for idx, bp in enumerate(body_parts_tracked_list):
+    count = train[train.body_parts_tracked == bp].shape[0]
+    print(f"{idx:2d} | {count:4d} files | {bp}")
+
+body_parts_tracked_list = sorted(train_without_mabe22.body_parts_tracked.unique())
+
+print("\nBody parts tracked and file counts excluding mabe22:\n")
+for idx, bp in enumerate(body_parts_tracked_list):
+    count = train[train.body_parts_tracked == bp].shape[0]
+    print(f"{idx:2d} | {count:4d} files | {bp}")
