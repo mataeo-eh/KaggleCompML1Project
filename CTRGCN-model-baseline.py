@@ -15,6 +15,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from scipy.ndimage import median_filter
+from tqdm import tqdm
 
 
 start_time = time.time()
@@ -547,6 +548,9 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
                         agent_str = f"mouse{agent}"
                         target_str = f"mouse{target}"
                         vid_agent_actions = np.unique(vid_behaviors_subset.query("(agent == @agent_str) & (target == @target_str)").action)
+                        if len(vid_agent_actions) == 0:
+                            continue
+
                         mouse_pair = pd.concat([pvid[agent], pvid[target]], axis=1, keys=["A", "B"])
                         assert len(mouse_pair) == len(pvid)
                         mouse_pair_meta = pd.DataFrame(
@@ -964,43 +968,105 @@ def compute_validation_f1_from_windows(windows_tuple, y_dict: dict[str, list], a
                 use_edge_importance=use_edge_importance,
             ).to(device)
 
-        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=getattr(config, "momentum", 0.9), weight_decay=getattr(config, "weight_decay", 1e-4))
-        if alpha_balance is not None:
-            pos_weight = torch.tensor([alpha_balance], device=device)
-            criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-        else:
-            criterion = torch.nn.BCEWithLogitsLoss()
+        # Align sample counts between labels and windows
+            n_samples = min(y_action.shape[0], x_len)
+            if n_samples == 0:
+                continue
+            if n_samples != y_action.shape[0] and verbose:
+                print(f"[train_ctr_gcn_models] Mismatch between labels ({y_action.shape[0]}) and windows ({x_len}) for action {action}; using {n_samples}")
+            y_action = y_action[:n_samples]
+            mask = mask[:n_samples]
+            
+            # -----------------------
+            # Compute n_samples FIRST
+            # -----------------------
+            n_samples = min(y_action.shape[0], x_len)
+            if n_samples == 0:
+                continue
 
-        for _ in range(epochs):
-            model.train()
-            for start in range(0, len(train_idx), 16):
-                end = start + 16
-                batch_ids = train_idx[start:end]
-                batch_y = y_action[batch_ids]
-                batch_mask = mask[batch_ids]
-                if mode == "one":
-                    logits = model(X_action[batch_ids]).squeeze(-1)
-                elif mode == "two":
-                    logits = model(X_action_A[batch_ids], X_action_B[batch_ids]).squeeze(-1)
-                else:
-                    logits = model(
-                        X_action_coords[batch_ids],
-                        X_action_delta[batch_ids],
-                        X_action_bone[batch_ids],
-                        X_action_bone_delta[batch_ids],
-                    ).squeeze(-1)
-                valid = batch_mask
-                if valid.sum().item() == 0:
-                    continue
-                logits = logits[valid]
-                batch_y = batch_y[valid]
-                optimizer.zero_grad()
-                loss = criterion(logits, batch_y)
-                loss.backward()
-                clip_val = getattr(config, "grad_clip", None)
-                if clip_val is not None:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_val)
-                optimizer.step()
+            y_action = y_action[:n_samples]
+            mask = mask[:n_samples]
+
+            # Build shuffled index array
+            train_idx = np.arange(n_samples)
+
+            # -----------------------
+            # Optimizer
+            # -----------------------
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=lr,
+                weight_decay=getattr(config, "weight_decay", 1e-4)
+            )
+
+            # -----------------------
+            # Warmup + Cosine schedule
+            # -----------------------
+            total_steps = epochs * math.ceil(n_samples / batch_size)
+            warmup_steps = max(10, int(0.1 * total_steps))
+
+            scheduler = WarmupCosineSchedule(
+                optimizer,
+                warmup_steps=warmup_steps,
+                total_steps=total_steps,
+                eta_min=1e-5
+            )
+            # -----------------------
+
+            # Loss
+            if alpha_balance is not None:
+                pos_weight = torch.tensor([alpha_balance], device=device)
+                criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            else:
+                criterion = torch.nn.BCEWithLogitsLoss()
+
+            # -----------------------
+            # TRAINING LOOP
+            # -----------------------
+            for epoch in epochs:
+
+                model.train()
+
+                # IMPORTANT: shuffle each epoch
+                np.random.shuffle(train_idx)
+
+                for start in range(0, n_samples, batch_size):
+                    end = min(start + batch_size, n_samples)
+                    batch_ids = train_idx[start:end]
+
+                    batch_y = y_action[batch_ids]
+                    batch_mask = mask[batch_ids]
+
+                    # Forward pass
+                    if mode == "one":
+                        logits = model(X_action[batch_ids]).squeeze(-1)
+                    elif mode == "two":
+                        logits = model(X_action_A[batch_ids], X_action_B[batch_ids]).squeeze(-1)
+                    else:
+                        logits = model(
+                            X_action_coords[batch_ids],
+                            X_action_delta[batch_ids],
+                            X_action_bone[batch_ids],
+                            X_action_bone_delta[batch_ids],
+                        ).squeeze(-1)
+
+                    valid = batch_mask
+                    if valid.sum().item() == 0:
+                        continue
+
+                    logits = logits[valid]
+                    batch_y_valid = batch_y[valid]
+
+                    optimizer.zero_grad()
+                    loss = criterion(logits, batch_y_valid)
+                    loss.backward()
+
+                    torch.nn.utils.clip_grad_norm_(model.parameters(),
+                                                max_norm=getattr(config, "grad_clip", 1.0))
+
+                    optimizer.step()
+                    scheduler.step()
+                
 
         model.eval()
         with torch.no_grad():
@@ -1118,7 +1184,7 @@ def train_ctr_gcn_models(batches, ordered_joints, adjacency, config: CTRGCNConfi
 
             total_pos = torch.nan_to_num(y_action, nan=0.0).sum().item()
             if verbose:
-                print(f"[train] action={action}, windows={y_action.shape[0]}, frames={y_action.shape[1]}, positives predicted={total_pos}")
+                print(f"[train] action={action}, windows={y_action.shape[0]}, frames={y_action.shape[1]}, positive labels of action={total_pos}")
 
 
 
@@ -1232,7 +1298,8 @@ def train_ctr_gcn_models(batches, ordered_joints, adjacency, config: CTRGCNConfi
             # -----------------------
             # TRAINING LOOP
             # -----------------------
-            for epoch in (tqdm(range(epochs), desc="training epochs") if config.show_progress else range(epochs)):
+            epoch_count = 0
+            for _ in range(epochs):
 
                 model.train()
 
@@ -1276,6 +1343,9 @@ def train_ctr_gcn_models(batches, ordered_joints, adjacency, config: CTRGCNConfi
                     optimizer.step()
                     scheduler.step()
                     learning_rate_updates += 1
+                epoch_count+=1
+                print (f"epoch {epoch_count} finished")
+                
 
             if verbose:
                 print(f"[train_ctr_gcn_models] Action '{action}' ")
@@ -1765,7 +1835,6 @@ if RUN_MODE == "submit":
 #=================================================
 #    Utility functions to aid model evaluation
 #=================================================
-from tqdm import tqdm
 import polars as pl
 
 
@@ -1962,9 +2031,7 @@ if RUN_MODE == "dev":
     else:
         total_sets = len(body_parts_tracked_list)
         dev_f1_df = pd.DataFrame(columns=["F1 Score"])
-        pbar = tqdm(body_parts_tracked_list)
-        for bp_idx, bp_str in enumerate(pbar):
-            pbar.set_description(f"Processing Body-part set {bp_idx + 1}/{total_sets}")
+        for bp_idx, bp_str in enumerate(body_parts_tracked_list):
             bp_slug = slugify_bodyparts(bp_str)
             body_parts_tracked = filter_tracked_body_parts(json.loads(bp_str))
             ordered_joints, adjacency = get_ordered_joints_and_adjacency(body_parts_tracked)
@@ -1985,15 +2052,16 @@ if RUN_MODE == "dev":
                 mode="dev",
                 max_videos=None,  # limit handled by slicing above
                 max_batches=20,
-                max_windows=500,
-                window=30,
-                stride=15,
+                max_windows=100,
+                window=70,
+                stride=30,
                 show_progress=True,
                 stream_mode=GLOBAL_CONFIG.get("stream_mode", "one"),
-                decision_threshold = 0.15,
+                decision_threshold = 0.10,
                 epochs = 2,
-                batch_size = 8,
+                batch_size = 7,
                 weight_decay = 0,
+                alpha_balance= 0.1,
             )
 
             # Train models on first 5 videos (single + pair)
@@ -2115,6 +2183,8 @@ if RUN_MODE == "dev":
             dev_f1_df.loc["Overall F1 Score"] = overall_f1
             print(f"\n[DEV] Average holdout F1 across body-part sets: {overall_f1:.4f}")
             csv_path = Path("dev_f1_scores-CTRGCN-baseline.csv")
+            dev_f1_df = dev_f1_df.reset_index(drop=True)
+            dev_f1_df.index = range(1, len(dev_f1_df) + 1)
             # If file exists → load and append
             if csv_path.exists():
                 existing_df = pd.read_csv(csv_path, index_col=0)
