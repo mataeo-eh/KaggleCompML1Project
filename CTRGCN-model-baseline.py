@@ -209,6 +209,7 @@ class CTRGCNBackbone(nn.Module):
             blocks.append(CTRGCNBlock(last_c, out_c, adjacency, stride=1, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, edge_importance=use_edge_importance))
             last_c = out_c
         self.st_blocks = nn.ModuleList(blocks)
+        self.out_dim = last_c
         self.fc = nn.Linear(last_c, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -222,12 +223,12 @@ class CTRGCNBackbone(nn.Module):
 
 
 class CTRGCNTwoStream(nn.Module):
-    def __init__(self, adjacency: np.ndarray, in_channels_coords: int = 2, in_channels_delta: int = 2, base_channels: int = 64, num_blocks: int = 12, dropout: float = 0.1, temporal_kernel: int = 9, use_ctr: bool = True, use_edge_importance: bool = True):
+    def __init__(self, adjacency: np.ndarray, in_channels_coords: int = 2, in_channels_delta: int = 2, base_channels: int = 64, num_blocks: int = 12, dropout: float = 0.1, temporal_kernel: int = 9, use_ctr: bool = True, use_edge_importance: bool = True, channels: list[int] | None = None):
         super().__init__()
-        channels = [base_channels] * num_blocks
-        self.stream_coords = CTRGCNBackbone(in_channels_coords, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
-        self.stream_delta = CTRGCNBackbone(in_channels_delta, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
-        self.fc = nn.Linear(base_channels, 1)
+        channels_schedule = channels  # None will trigger backbone default schedule
+        self.stream_coords = CTRGCNBackbone(in_channels_coords, base_channels, adjacency, channels=channels_schedule, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
+        self.stream_delta = CTRGCNBackbone(in_channels_delta, base_channels, adjacency, channels=channels_schedule, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
+        self.fc = nn.Linear(self.stream_coords.out_dim, 1)
 
     def forward(self, coords_x: torch.Tensor, delta_x: torch.Tensor) -> torch.Tensor:
         feat_A = self.stream_coords(coords_x)
@@ -238,14 +239,14 @@ class CTRGCNTwoStream(nn.Module):
 
 
 class CTRGCNFourStream(nn.Module):
-    def __init__(self, adjacency, base_channels=64, dropout=0.1, num_blocks=12, temporal_kernel: int = 9, use_ctr: bool = True, use_edge_importance: bool = True):
+    def __init__(self, adjacency, base_channels=64, dropout=0.1, num_blocks=12, temporal_kernel: int = 9, use_ctr: bool = True, use_edge_importance: bool = True, channels: list[int] | None = None):
         super().__init__()
-        channels = [base_channels] * num_blocks
-        self.stream_coords = CTRGCNBackbone(2, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
-        self.stream_delta = CTRGCNBackbone(2, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
-        self.stream_bone = CTRGCNBackbone(2, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
-        self.stream_bone_delta = CTRGCNBackbone(2, base_channels, adjacency, channels=channels, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
-        self.fc = nn.Linear(base_channels, 1)
+        channels_schedule = channels  # None will trigger backbone default schedule
+        self.stream_coords = CTRGCNBackbone(2, base_channels, adjacency, channels=channels_schedule, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
+        self.stream_delta = CTRGCNBackbone(2, base_channels, adjacency, channels=channels_schedule, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
+        self.stream_bone = CTRGCNBackbone(2, base_channels, adjacency, channels=channels_schedule, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
+        self.stream_bone_delta = CTRGCNBackbone(2, base_channels, adjacency, channels=channels_schedule, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, use_edge_importance=use_edge_importance)
+        self.fc = nn.Linear(self.stream_coords.out_dim, 1)
 
     def forward(self, coords_x, delta_x, bone_x, bone_delta_x):
         f1 = self.stream_coords(coords_x)
@@ -530,6 +531,7 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
                         for i in range(len(annot_subset)):
                             annot_row = annot_subset.iloc[i]
                             single_mouse_label.loc[annot_row["start_frame"] : annot_row["stop_frame"], annot_row.action] = 1.0
+                        single_mouse_label = single_mouse_label.fillna(0.0)
                         yield "single", single_mouse, single_mouse_meta, single_mouse_label
                         batch_count += 1
                     else:
@@ -567,6 +569,7 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
                             for i in range(len(annot_subset)):
                                 annot_row = annot_subset.iloc[i]
                                 mouse_pair_label.loc[annot_row["start_frame"] : annot_row["stop_frame"], annot_row.action] = 1.0
+                            mouse_pair_label = mouse_pair_label.fillna(0.0)
                             yield "pair", mouse_pair, mouse_pair_meta, mouse_pair_label
                             batch_count += 1
                         else:
@@ -2056,12 +2059,12 @@ if RUN_MODE == "dev":
                 window=70,
                 stride=30,
                 show_progress=True,
-                stream_mode=GLOBAL_CONFIG.get("stream_mode", "one"),
-                decision_threshold = 0.10,
+                stream_mode="one",
+                decision_threshold = 0.3,
                 epochs = 2,
                 batch_size = 7,
                 weight_decay = 0,
-                alpha_balance= 0.1,
+                alpha_balance= 1.6,
             )
 
             # Train models on first 5 videos (single + pair)
@@ -2180,11 +2183,11 @@ if RUN_MODE == "dev":
 
         if not dev_f1_df.empty:
             overall_f1 = dev_f1_df["F1 Score"].mean()
-            dev_f1_df.loc["Overall F1 Score"] = overall_f1
             print(f"\n[DEV] Average holdout F1 across body-part sets: {overall_f1:.4f}")
             csv_path = Path("dev_f1_scores-CTRGCN-baseline.csv")
             dev_f1_df = dev_f1_df.reset_index(drop=True)
             dev_f1_df.index = range(1, len(dev_f1_df) + 1)
+            dev_f1_df.loc["Overall F1 Score"] = overall_f1
             # If file exists → load and append
             if csv_path.exists():
                 existing_df = pd.read_csv(csv_path, index_col=0)

@@ -15,6 +15,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from scipy.ndimage import median_filter
+from tqdm import tqdm
 
 
 start_time = time.time()
@@ -32,14 +33,19 @@ GLOBAL_CONFIG = {
     "max_tuning_trials": 60,
     "tuning_min_videos": 3,
     "param_distributions": {
-        "window": [30, 60, 90, 120],
-        "stride": [7, 15, 30],
-        "base_channels": [32, 48, 64, 96],
-        "num_blocks": [1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20],
+        "window": [32, 64, 96],
+        "stride": [16, 32],
+        "base_channels": [64, 96, 128],
+        "num_blocks": [8, 10, 12],
         "dropout": [0.05, 0.1, 0.2, 0.3],
-        "learning_rate": [1, 0.1, 0.01, 1e-3, 5e-4, 1e-4],
-        "alpha_class_balance": [0.5, 1.0, 1.5],
-        "decision_threshold" : [0.1, 0.2, 0.25, 0.30, 0.35, 0.40, 0.45],
+        "learning_rate": [0.1, 0.05, 0.01],
+        "momentum": [0.8, 0.9],
+        "weight_decay": [1e-4, 5e-4],
+        "batch_size": [16, 32, 64, 128],
+        "epochs": [60, 90, 120, 500, 1000],
+        "alpha_class_balance": [0.25, 0.5, 1.0, 1.5, 2.0],
+        "decision_threshold" : [0.1, 0.2, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50],
+        "temporal_kernel_size": [5, 7, 9],
     },
 }
 
@@ -75,14 +81,223 @@ class CTRGCNConfig:
     in_channels_bone_only: int = 2
     in_channels_bone_delta_only: int = 2
 
-    window: int = 50
+    window: int = 32
     stride: int = 15
-    base_channels: int = 96
+    base_channels: int = 64
     num_blocks: int = 12
+    temporal_kernel_size: int = 9
+    use_ctr: bool = True
+    use_edge_importance: bool = True
     dropout: float = 0.1
-    lr: float = 1e-3
+    lr: float = 0.1
+    momentum: float = 0.9
+    weight_decay: float = 1e-4
+    batch_size: int = 64
+    epochs: int = 60
+    grad_clip: float = 1.0
     alpha_balance: float | None = None
-    decision_threshold: float | None = 0.2
+    decision_threshold: float = 0.25
+    use_random_crop: bool = True
+    use_random_rotation: bool = True
+    max_rotation_deg: float = 15.0
+    crop_jitter_frames: int = 8
+
+
+class WarmupCosineSchedule(torch.optim.lr_scheduler._LRScheduler):
+    def __init__(self, optimizer, warmup_steps, total_steps, eta_min=1e-5, last_epoch=-1):
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.eta_min = eta_min
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        step = self.last_epoch + 1
+        if step < self.warmup_steps:
+            # Linear warmup: lr = base_lr * (step / warmup_steps)
+            scale = float(step) / float(max(1, self.warmup_steps))
+            return [base_lr * scale for base_lr in self.base_lrs]
+
+        # Cosine decay after warmup
+        progress = float(step - self.warmup_steps) / float(max(1, self.total_steps - self.warmup_steps))
+        cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+        return [
+            self.eta_min + (base_lr - self.eta_min) * cosine_decay
+            for base_lr in self.base_lrs
+        ]
+
+import math
+class CTRGraphConv(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, adjacency: np.ndarray, coff_embedding: int = 4, use_ctr: bool = True):
+        super().__init__()
+        A_norm = _normalize_adjacency_chain(adjacency)
+        self.A_base = nn.Parameter(torch.from_numpy(A_norm), requires_grad=True)
+        self.use_ctr = use_ctr
+        inter_channels = max(1, out_channels // coff_embedding)
+        self.theta = nn.Conv2d(out_channels, inter_channels, kernel_size=1)
+        self.phi = nn.Conv2d(out_channels, inter_channels, kernel_size=1)
+        self.alpha = nn.Parameter(torch.zeros(1))
+        self.proj = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=True)
+        self.bn = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x: torch.Tensor, edge_importance: torch.Tensor | None = None) -> torch.Tensor:
+        # x: (N, C_in, V, T)
+        x = self.proj(x)  # (N, C_out, V, T)
+        A_eff = self.A_base
+        if edge_importance is not None:
+            A_eff = A_eff * edge_importance
+
+        if self.use_ctr:
+            theta_x = self.theta(x)  # (N, C_mid, V, T)
+            phi_x = self.phi(x)
+            N, C_mid, V, T = theta_x.shape
+            theta_f = theta_x.mean(-1)        # (N, C_mid, V)
+            phi_f   = phi_x.mean(-1)          # (N, C_mid, V)
+
+            refine = torch.einsum("ncv,ncw->nvw", theta_f, phi_f)
+            refine = refine.mean(0) / math.sqrt(C_mid)
+            refine = torch.tanh(refine)  # (V, V)
+
+            A_eff = A_eff + self.alpha * refine
+
+        x = torch.einsum("ncvt,vw->ncwt", x, A_eff)
+        x = self.bn(x)
+        return x
+
+
+class CTRGCNBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, adjacency: np.ndarray, stride: int = 1, dropout: float = 0.1, temporal_kernel: int = 9, use_ctr: bool = True, edge_importance: bool = True):
+        super().__init__()
+        self.gcn = CTRGraphConv(in_channels, out_channels, adjacency, use_ctr=use_ctr)
+        pad_t = temporal_kernel // 2
+        self.tcn = nn.Sequential(
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=(1, temporal_kernel), padding=(0, pad_t), stride=(1, stride), bias=True),
+            nn.BatchNorm2d(out_channels),
+            nn.Dropout(dropout),
+        )
+        if (in_channels != out_channels) or (stride != 1):
+            self.residual = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=(1, stride), bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+        else:
+            self.residual = nn.Identity()
+        self.relu = nn.ReLU(inplace=True)
+        self.edge_importance = edge_importance
+
+    def forward(self, x: torch.Tensor, edge_importance: torch.Tensor | None = None) -> torch.Tensor:
+        res = self.residual(x)
+        x = self.gcn(x, edge_importance if self.edge_importance else None)
+        x = self.tcn(x)
+        x = x + res
+        x = self.relu(x)
+        return x
+
+
+class CTRGCNBackbone(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        num_classes: int,
+        adjacency: np.ndarray,
+        channels: list[int] | None = None,
+        dropout: float = 0.1,
+        temporal_kernel: int = 9,
+        use_ctr: bool = True,
+        use_edge_importance: bool = True,
+        use_classifier: bool = True,
+    ):
+        super().__init__()
+        if channels is None:
+            channels = [64, 64, 64, 64, 96, 96, 96, 96, 128, 128, 128, 128]
+        blocks = []
+        last_c = in_channels
+        self.edge_importance = nn.ParameterList(
+            [nn.Parameter(torch.ones_like(torch.from_numpy(_normalize_adjacency_chain(adjacency))), requires_grad=True) if use_edge_importance else nn.Parameter(torch.ones_like(torch.from_numpy(_normalize_adjacency_chain(adjacency))), requires_grad=False) for _ in channels]
+        )
+        for idx, out_c in enumerate(channels):
+            blocks.append(CTRGCNBlock(last_c, out_c, adjacency, stride=1, dropout=dropout, temporal_kernel=temporal_kernel, use_ctr=use_ctr, edge_importance=use_edge_importance))
+            last_c = out_c
+        self.st_blocks = nn.ModuleList(blocks)
+        self.out_dim = last_c
+        self.use_classifier = use_classifier
+        self.fc = nn.Linear(last_c, num_classes) if use_classifier else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = x
+        for block, imp in zip(self.st_blocks, self.edge_importance):
+            out = block(out, imp)
+        out = out.mean(dim=-2)  # (N, C_out, T)
+        out = out.permute(0, 2, 1)  # (N, T, C_out)
+        if self.fc is None:
+            return out
+        logits = self.fc(out)
+        return logits
+
+
+class CTRGCNTwoStream(nn.Module):
+    def __init__(self, adjacency: np.ndarray, num_classes: int, in_channels_coords: int = 2, in_channels_delta: int = 2, base_channels: int = 64, num_blocks: int = 12, dropout: float = 0.1, temporal_kernel: int = 9, use_ctr: bool = True, use_edge_importance: bool = True, channels: list[int] | None = None):
+        super().__init__()
+        channels_schedule = channels  # None will trigger backbone default schedule
+        self.stream_coords = CTRGCNBackbone(
+            in_channels_coords,
+            num_classes=base_channels,
+            adjacency=adjacency,
+            channels=channels_schedule,
+            dropout=dropout,
+            temporal_kernel=temporal_kernel,
+            use_ctr=use_ctr,
+            use_edge_importance=use_edge_importance,
+            use_classifier=False,
+        )
+        self.stream_delta = CTRGCNBackbone(
+            in_channels_delta,
+            num_classes=base_channels,
+            adjacency=adjacency,
+            channels=channels_schedule,
+            dropout=dropout,
+            temporal_kernel=temporal_kernel,
+            use_ctr=use_ctr,
+            use_edge_importance=use_edge_importance,
+            use_classifier=False,
+        )
+        self.fc = nn.Linear(self.stream_coords.out_dim, num_classes)
+
+    def forward(self, coords_x: torch.Tensor, delta_x: torch.Tensor) -> torch.Tensor:
+        feat_A = self.stream_coords(coords_x)
+        feat_B = self.stream_delta(delta_x)
+        fused = feat_A + feat_B
+        logits = self.fc(fused)
+        return logits
+
+
+class CTRGCNFourStream(nn.Module):
+    def __init__(self, adjacency, num_classes: int, base_channels=64, dropout=0.1, num_blocks=12, temporal_kernel: int = 9, use_ctr: bool = True, use_edge_importance: bool = True, channels: list[int] | None = None):
+        super().__init__()
+        channels_schedule = channels  # None will trigger backbone default schedule
+        backbone_kwargs = dict(
+            adjacency=adjacency,
+            channels=channels_schedule,
+            dropout=dropout,
+            temporal_kernel=temporal_kernel,
+            use_ctr=use_ctr,
+            use_edge_importance=use_edge_importance,
+            use_classifier=False,
+        )
+        self.stream_coords = CTRGCNBackbone(2, num_classes=base_channels, **backbone_kwargs)
+        self.stream_delta = CTRGCNBackbone(2, num_classes=base_channels, **backbone_kwargs)
+        self.stream_bone = CTRGCNBackbone(2, num_classes=base_channels, **backbone_kwargs)
+        self.stream_bone_delta = CTRGCNBackbone(2, num_classes=base_channels, **backbone_kwargs)
+        self.fc = nn.Linear(self.stream_coords.out_dim, num_classes)
+
+    def forward(self, coords_x, delta_x, bone_x, bone_delta_x):
+        f1 = self.stream_coords(coords_x)
+        f2 = self.stream_delta(delta_x)
+        f3 = self.stream_bone(bone_x)
+        f4 = self.stream_bone_delta(bone_delta_x)
+        fused = f1 + f2 + f3 + f4
+        return self.fc(fused)
 
 
 # ======================
@@ -99,7 +314,7 @@ def slugify_bodyparts(bp_str: str) -> str:
 
 
 def get_stream_model_dir(cfg: CTRGCNConfig, bp_slug: str | None = None) -> str:
-    root = "./CTR-GCN-Models3.0"
+    root = "./CTR-GCN-Models2.0"
     tag = get_stream_mode_tag(cfg)
     sub = {"one": "one_stream", "two": "two_stream", "four": "four_stream"}[tag]
     if bp_slug is None:
@@ -142,6 +357,28 @@ def extract_actions_from_behaviors_labeled(raw_str: str) -> list[str]:
         action = parts[-1]
         out.append(action)
     return sorted(list(set(out)))
+
+def compute_actions_for_dataset(dataset: pd.DataFrame) -> tuple[list[str], list[str]]:
+    """Compute global action lists for single (self) and pair (non-self) cases."""
+    single_actions: set[str] = set()
+    pair_actions: set[str] = set()
+    for _, row in dataset.iterrows():
+        if not isinstance(row.behaviors_labeled, str):
+            continue
+        try:
+            entries = json.loads(row.behaviors_labeled)
+        except Exception:
+            continue
+        for ent in entries:
+            parts = ent.replace("'", "").split(",")
+            if len(parts) != 3:
+                continue
+            _, target, action = parts
+            if target == "self":
+                single_actions.add(action)
+            else:
+                pair_actions.add(action)
+    return sorted(single_actions), sorted(pair_actions)
 
 
 # ======================
@@ -239,6 +476,7 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
     if traintest_directory is None:
         #traintest_directory = f"/kaggle/input/MABe-mouse-behavior-detection/{traintest}_tracking"
         traintest_directory = f"./Data/{traintest}_tracking"
+    actions_single_all, actions_pair_all = compute_actions_for_dataset(dataset)
     video_count = 0
     batch_count = 0
     for _, row in dataset.iterrows():
@@ -294,7 +532,6 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
 
         if len(np.unique(vid.bodypart)) > 5:
             vid = vid.query("~ bodypart.isin(@drop_body_parts)")
-        #Commented out for testing to see if this is affecting GCN skeleton creation
         pvid = vid.pivot(columns=["mouse_id", "bodypart"], index="video_frame", values=["x", "y"])
         if pvid.isna().any().any():
             # Compute missing ratio per joint
@@ -343,7 +580,7 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
                     return
                 try:
                     mouse_id = int(mouse_id_str[-1])
-                    vid_agent_actions = np.unique(vid_behaviors_subset.query("agent == @mouse_id_str").action)
+                    vid_agent_actions = actions_single_all
                     single_mouse = pvid.loc[:, mouse_id]
                     assert len(single_mouse) == len(pvid)
                     single_mouse_meta = pd.DataFrame(
@@ -355,11 +592,12 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
                         }
                     )
                     if traintest == "train":
-                        single_mouse_label = pd.DataFrame(np.nan, columns=vid_agent_actions, index=single_mouse.index)
+                        single_mouse_label = pd.DataFrame(0.0, columns=vid_agent_actions, index=single_mouse.index)
                         annot_subset = annot.query("(agent_id == @mouse_id) & (target_id == @mouse_id)")
                         for i in range(len(annot_subset)):
                             annot_row = annot_subset.iloc[i]
-                            single_mouse_label.loc[annot_row["start_frame"] : annot_row["stop_frame"], annot_row.action] = 1.0
+                            if annot_row.action in single_mouse_label.columns:
+                                single_mouse_label.loc[annot_row["start_frame"] : annot_row["stop_frame"], annot_row.action] = 1.0
                         yield "single", single_mouse, single_mouse_meta, single_mouse_label
                         batch_count += 1
                     else:
@@ -377,7 +615,8 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
                             return
                         agent_str = f"mouse{agent}"
                         target_str = f"mouse{target}"
-                        vid_agent_actions = np.unique(vid_behaviors_subset.query("(agent == @agent_str) & (target == @target_str)").action)
+                        vid_agent_actions = actions_pair_all
+
                         mouse_pair = pd.concat([pvid[agent], pvid[target]], axis=1, keys=["A", "B"])
                         assert len(mouse_pair) == len(pvid)
                         mouse_pair_meta = pd.DataFrame(
@@ -389,11 +628,12 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
                             }
                         )
                         if traintest == "train":
-                            mouse_pair_label = pd.DataFrame(np.nan, columns=vid_agent_actions, index=mouse_pair.index)
+                            mouse_pair_label = pd.DataFrame(0.0, columns=vid_agent_actions, index=mouse_pair.index)
                             annot_subset = annot.query("(agent_id == @agent) & (target_id == @target)")
                             for i in range(len(annot_subset)):
                                 annot_row = annot_subset.iloc[i]
-                                mouse_pair_label.loc[annot_row["start_frame"] : annot_row["stop_frame"], annot_row.action] = 1.0
+                                if annot_row.action in mouse_pair_label.columns:
+                                    mouse_pair_label.loc[annot_row["start_frame"] : annot_row["stop_frame"], annot_row.action] = 1.0
                             yield "pair", mouse_pair, mouse_pair_meta, mouse_pair_label
                             batch_count += 1
                         else:
@@ -426,187 +666,6 @@ def _normalize_adjacency_chain(adjacency: np.ndarray) -> np.ndarray:
     row_sum[row_sum == 0.0] = 1.0
     return A / row_sum
 
-class DynamicAdjacency(nn.Module):
-    """
-    SOTA CTR-GCN dynamic adjacency:
-       A_dyn = softmax( (theta(x)^T phi(x)) / sqrt(C) )
-       g(x) projected back to original channels.
-    """
-    def __init__(self, in_channels, reduction_ratio=8):
-        super().__init__()
-        hidden = max(in_channels // reduction_ratio, 16)
-
-        self.theta = nn.Conv2d(in_channels, hidden, 1, bias=False)
-        self.phi   = nn.Conv2d(in_channels, hidden, 1, bias=False)
-        self.g     = nn.Conv2d(in_channels, hidden, 1, bias=False)
-
-        self.out_proj = nn.Conv2d(hidden, in_channels, 1, bias=False)
-
-    def forward(self, x):
-        # x: (N, C, V, T)
-        theta = self.theta(x).mean(-1)   # (N, hidden, V)
-        phi   = self.phi(x).mean(-1)     # (N, hidden, V)
-        g_x   = self.g(x).mean(-1)       # (N, hidden, V)
-
-        att = torch.matmul(theta.transpose(2,1), phi) / (theta.shape[1] ** 0.5)
-        att = torch.softmax(att, dim=-1)              # (N, V, V)
-
-        # Apply dynamic adjacency to g(x)
-        dyn = torch.matmul(g_x, att.transpose(2,1))   # (N, hidden, V)
-        dyn = dyn.unsqueeze(-1)                       # (N, hidden, V, 1)
-        dyn = self.out_proj(dyn)                      # back to C channels
-        return dyn
-
-    
-class CTRGraphConv(nn.Module):
-    """
-    Three-branch spatial graph conv from CTR-GCN:
-       static branch
-       dynamic adjacency branch
-       pointwise (local) branch
-    """
-    def __init__(self, in_channels, out_channels, adjacency):
-        super().__init__()
-        A_norm = _normalize_adjacency_chain(adjacency)
-        self.register_buffer("A", torch.from_numpy(A_norm))
-
-        self.conv_static   = nn.Conv2d(in_channels, out_channels, 1, bias=False)
-        self.conv_dynamic  = nn.Conv2d(in_channels, out_channels, 1, bias=False)
-        self.conv_point    = nn.Conv2d(in_channels, out_channels, 1, bias=False)
-
-        self.dynamic_adj = DynamicAdjacency(in_channels)
-
-        self.bn = nn.BatchNorm2d(out_channels)
-
-    def forward(self, x):
-        # ----- Static adjacency -----
-        static = torch.einsum("ncvT,vw->ncwT", x, self.A)
-        static = self.conv_static(static)
-
-        # ----- Dynamic adjacency -----
-        dyn_feat = self.dynamic_adj(x)             # (N, C, V, 1)
-        dyn_feat = dyn_feat.repeat(1, 1, 1, x.size(-1))  # broadcast T
-        dyn      = self.conv_dynamic(dyn_feat)
-
-        # ----- Pointwise feature mixing -----
-        pw = self.conv_point(x)
-
-        out = static + dyn + pw
-        return self.bn(out)
-
-
-
-class STBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, adjacency,
-                 stride=1, dropout=0.2, kernel_size=9):
-        super().__init__()
-
-        self.gcn = CTRGraphConv(in_channels, out_channels, adjacency)
-
-        pad = (kernel_size - 1) // 2
-        self.tcn = nn.Sequential(
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels,
-                      kernel_size=(1, kernel_size),
-                      stride=(1, stride),
-                      padding=(0, pad),
-                      bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.Dropout(dropout),
-        )
-
-        if in_channels != out_channels or stride != 1:
-            self.residual = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1,
-                          stride=(1, stride), bias=False),
-                nn.BatchNorm2d(out_channels),
-            )
-        else:
-            self.residual = nn.Identity()
-
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        res = self.residual(x)
-        x = self.gcn(x)
-        x = self.tcn(x)
-        x = x + res
-        return self.relu(x)
-
-
-
-
-class CTRGCNMedium(nn.Module):
-    """
-    SOTA-style CTR-GCN backbone (12 blocks):
-    - 4 blocks @ 64
-    - 4 blocks @ 128
-    - 4 blocks @ 256
-    - Temporal kernels: 9 for first 8 blocks, 5 for last 4
-    """
-    def __init__(self,
-                 in_channels: int,
-                 num_classes: int,
-                 adjacency: np.ndarray,
-                 dropout: float = 0.2):
-        super().__init__()
-
-        channels = [64]*4 + [128]*4 + [256]*4
-        kernels  = [9]*8 + [5]*4
-
-        blocks = []
-        last_c = in_channels
-
-        for out_c, k in zip(channels, kernels):
-            blocks.append(STBlock(last_c, out_c, adjacency,
-                                  stride=1, dropout=dropout, kernel_size=k))
-            last_c = out_c
-
-        self.st_blocks = nn.ModuleList(blocks)
-        self.fc = nn.Linear(last_c, num_classes)
-
-    def forward(self, x):
-        # (N, C_in, V, T)
-        for blk in self.st_blocks:
-            x = blk(x)
-
-        x = x.mean(dim=-2)       # (N, C, T)
-        x = x.permute(0, 2, 1)   # (N, T, C)
-        return self.fc(x)
-
-
-
-class CTRGCNTwoStream(nn.Module):
-    def __init__(self, adjacency: np.ndarray, in_channels_coords: int = 2, in_channels_delta: int = 2, base_channels: int = 64, num_blocks: int = 3, dropout: float = 0.1):
-        super().__init__()
-        self.stream_coords = CTRGCNMedium(in_channels_coords, base_channels, adjacency, base_channels, num_blocks, dropout)
-        self.stream_delta = CTRGCNMedium(in_channels_delta, base_channels, adjacency, base_channels, num_blocks, dropout)
-        self.fc = nn.Linear(base_channels, 1)
-
-    def forward(self, coords_x: torch.Tensor, delta_x: torch.Tensor) -> torch.Tensor:
-        feat_A = self.stream_coords(coords_x)
-        feat_B = self.stream_delta(delta_x)
-        fused = feat_A + feat_B
-        logits = self.fc(fused)
-        return logits
-
-
-class CTRGCNFourStream(nn.Module):
-    def __init__(self, adjacency, base_channels=64, dropout=0.1, num_blocks=3):
-        super().__init__()
-        self.stream_coords = CTRGCNMedium(2, base_channels, adjacency, base_channels, num_blocks, dropout)
-        self.stream_delta = CTRGCNMedium(2, base_channels, adjacency, base_channels, num_blocks, dropout)
-        self.stream_bone = CTRGCNMedium(2, base_channels, adjacency, base_channels, num_blocks, dropout)
-        self.stream_bone_delta = CTRGCNMedium(2, base_channels, adjacency, base_channels, num_blocks, dropout)
-        self.fc = nn.Linear(base_channels, 1)
-
-    def forward(self, coords_x, delta_x, bone_x, bone_delta_x):
-        f1 = self.stream_coords(coords_x)
-        f2 = self.stream_delta(delta_x)
-        f3 = self.stream_bone(bone_x)
-        f4 = self.stream_bone_delta(bone_delta_x)
-        fused = f1 + f2 + f3 + f4
-        return self.fc(fused)
 
 
 # ======================
@@ -755,7 +814,8 @@ def collect_ctr_gcn_windows(batches, ordered_joints, config: CTRGCNConfig):
     delta_windows_single: list[torch.Tensor] = []
     bone_windows_single: list[torch.Tensor] = []
     bone_delta_windows_single: list[torch.Tensor] = []
-    y_dict_single: dict[str, list] = {}
+    label_windows_single: list[torch.Tensor] = []
+    actions_single: list[str] | None = None
 
     X_windows_pair: list[torch.Tensor] = []
     streamA_windows_pair: list[torch.Tensor] = []
@@ -764,7 +824,8 @@ def collect_ctr_gcn_windows(batches, ordered_joints, config: CTRGCNConfig):
     delta_windows_pair: list[torch.Tensor] = []
     bone_windows_pair: list[torch.Tensor] = []
     bone_delta_windows_pair: list[torch.Tensor] = []
-    y_dict_pair: dict[str, list] = {}
+    label_windows_pair: list[torch.Tensor] = []
+    actions_pair: list[str] | None = None
     frame_ranges_single: list = []
     frame_ranges_pair: list = []
 
@@ -801,14 +862,11 @@ def collect_ctr_gcn_windows(batches, ordered_joints, config: CTRGCNConfig):
                 batch_count += 1
                 continue
 
-        # Ensure action lists exist only for actions present in this label_df
-        for action in label_df.columns:
-            if switch == "single":
-                if action not in y_dict_single:
-                    y_dict_single[action] = []
-            else:
-                if action not in y_dict_pair:
-                    y_dict_pair[action] = []
+        # cache action order
+        if switch == "single" and actions_single is None:
+            actions_single = list(label_df.columns)
+        if switch == "pair" and actions_pair is None:
+            actions_pair = list(label_df.columns)
 
         for i, frame_range in enumerate(frame_ranges):
             if mode == "one":
@@ -840,11 +898,12 @@ def collect_ctr_gcn_windows(batches, ordered_joints, config: CTRGCNConfig):
                     bone_windows_pair.append(bone_list[i])
                     bone_delta_windows_pair.append(bone_delta_list[i])
                     frame_ranges_pair.append(frame_range)
-            target_dict = y_dict_single if switch == "single" else y_dict_pair
-            actions_present = [a for a in target_dict.keys() if a in label_df.columns]
-            for action in actions_present:
-                window_labels = label_df[action].reindex(frame_range).to_numpy(dtype=np.float32)
-                target_dict[action].append(window_labels)
+            labels_window = label_df.loc[frame_range].to_numpy(dtype=np.float32)
+            labels_tensor = torch.from_numpy(labels_window)
+            if switch == "single":
+                label_windows_single.append(labels_tensor)
+            else:
+                label_windows_pair.append(labels_tensor)
 
         batch_count += 1
 
@@ -861,7 +920,11 @@ def collect_ctr_gcn_windows(batches, ordered_joints, config: CTRGCNConfig):
 
     result["windows_single"] = single_tuple
     result["windows_pair"] = pair_tuple
-    result["labels"] = {"single": y_dict_single, "pair": y_dict_pair}
+    result["labels"] = {
+        "single": torch.stack(label_windows_single, dim=0) if len(label_windows_single) > 0 else torch.empty((0, window_len, len(actions_single) if actions_single else 0)),
+        "pair": torch.stack(label_windows_pair, dim=0) if len(label_windows_pair) > 0 else torch.empty((0, window_len, len(actions_pair) if actions_pair else 0)),
+    }
+    result["actions"] = {"single": actions_single or [], "pair": actions_pair or []}
     result["frame_ranges"] = {"single": frame_ranges_single, "pair": frame_ranges_pair}
     return result
 
@@ -869,13 +932,12 @@ def collect_ctr_gcn_windows(batches, ordered_joints, config: CTRGCNConfig):
 # ======================
 # TRAINING / VALIDATION UTIL
 # ======================
-def compute_validation_f1_from_windows(windows_tuple, y_dict: dict[str, list], adjacency: np.ndarray, config: CTRGCNConfig, device: str, seed: int = 0) -> float:
+def compute_validation_f1_from_windows(windows_tuple, labels_tensor: torch.Tensor, adjacency: np.ndarray, config: CTRGCNConfig, device: str, seed: int = 0) -> float:
     mode, data = windows_tuple
-    if mode == "one" and data.shape[0] == 0:
+    if (mode == "one" and (data is None or data.shape[0] == 0)) or labels_tensor.numel() == 0:
         return 0.0
-    if mode in ("two", "four"):
-        if not data or (isinstance(data, tuple) and len(data[0]) == 0):
-            return 0.0
+    if mode in ("two", "four") and (not data or (isinstance(data, tuple) and len(data[0]) == 0)):
+        return 0.0
 
     if mode == "one":
         X = data.to(device)
@@ -888,341 +950,294 @@ def compute_validation_f1_from_windows(windows_tuple, y_dict: dict[str, list], a
         X_bone = torch.stack(data[2], dim=0).to(device)
         X_bone_delta = torch.stack(data[3], dim=0).to(device)
 
+    y_all = labels_tensor.to(device)  # (N, T, num_actions)
     base_channels = getattr(config, "base_channels", 64)
     num_blocks = getattr(config, "num_blocks", 3)
     dropout = getattr(config, "dropout", 0.1)
     lr = getattr(config, "lr", 1e-3)
-    alpha_balance = getattr(config, "alpha_balance", None)
+    epochs = getattr(config, "epochs", 2)
+    batch_size = getattr(config, "batch_size", 16)
 
-    if config.mode == "dev":
-        epochs = 1
-    elif config.mode == "validate":
-        epochs = 5
+    if mode == "one":
+        x_len = X.shape[0]
+    elif mode == "two":
+        x_len = min(len(data[0]), len(data[1]))
     else:
-        epochs = 7
-
-    f1_scores: list[float] = []
-    rng = np.random.default_rng(seed)
-
-    for action, labels in y_dict.items():
-        y_tensor = torch.tensor(labels, dtype=torch.float32, device=device)  # (N, T)
-        mask = ~torch.isnan(y_tensor)
-        if mask.sum().item() < 2:
-            continue
-        y_action = y_tensor
-
-        if mode == "one":
-            X_action = X
-        elif mode == "two":
-            X_action_A = X_streamA
-            X_action_B = X_streamB
-        else:
-            X_action_coords = X_coords
-            X_action_delta = X_delta
-            X_action_bone = X_bone
-            X_action_bone_delta = X_bone_delta
-
-        if mode == "one":
-            x_len = X_action.shape[0]
-        elif mode == "two":
-            x_len = X_action_A.shape[0]
-        else:
-            x_len = X_action_coords.shape[0]
-        n_samples = min(y_action.shape[0], x_len)
-        if n_samples <= 1:
-            continue
-        if n_samples != y_action.shape[0] and verbose:
-            print(f"[compute_validation_f1_from_windows] Mismatch between labels ({y_action.shape[0]}) and windows ({x_len}); using {n_samples}")
-        y_action = y_action[:n_samples]
-        mask = mask[:n_samples]
-        perm = rng.permutation(n_samples)
-        split_idx = max(1, int(0.8 * n_samples))
-        if split_idx >= n_samples:
-            split_idx = n_samples - 1
-        train_idx = perm[:split_idx]
-        val_idx = perm[split_idx:]
-
-        if mode == "one":
-            model = CTRGCNMedium(
-                in_channels=config.in_channels_single_stream,
-                num_classes=1,
-                adjacency=adjacency,
-                dropout=dropout,
-            ).to(device)
-        elif mode == "two":
-            model = CTRGCNTwoStream(
-                adjacency=adjacency,
-                in_channels_coords=config.in_channels_streamA,
-                in_channels_delta=config.in_channels_streamB,
-                base_channels=base_channels,
-                num_blocks=num_blocks,
-                dropout=dropout,
-            ).to(device)
-        else:
-            model = CTRGCNFourStream(adjacency=adjacency, base_channels=base_channels, dropout=dropout, num_blocks=num_blocks).to(device)
-
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=lr,               
-            weight_decay=1e-4
-        )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=epochs,         # ★ same number of epochs you already loop over
-        eta_min=1e-5
-        )
-        if alpha_balance is not None:
-            pos_weight = torch.tensor([alpha_balance], device=device)
-            criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-        else:
-            criterion = torch.nn.BCEWithLogitsLoss()
-
-        for _ in range(epochs):
-            model.train()
-            for start in range(0, len(train_idx), 16):
-                end = start + 16
-                batch_ids = train_idx[start:end]
-                batch_y = y_action[batch_ids]
-                batch_mask = mask[batch_ids]
-                if mode == "one":
-                    logits = model(X_action[batch_ids]).squeeze(-1)
-                elif mode == "two":
-                    logits = model(X_action_A[batch_ids], X_action_B[batch_ids]).squeeze(-1)
-                else:
-                    logits = model(
-                        X_action_coords[batch_ids],
-                        X_action_delta[batch_ids],
-                        X_action_bone[batch_ids],
-                        X_action_bone_delta[batch_ids],
-                    ).squeeze(-1)
-                valid = batch_mask
-                if valid.sum().item() == 0:
-                    continue
-                logits = logits[valid]
-                batch_y = batch_y[valid]
-                optimizer.zero_grad()
-                loss = criterion(logits, batch_y)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                scheduler.step()
-                
-        model.eval()
-        with torch.no_grad():
-            if mode == "one":
-                logits_val = model(X_action[val_idx]).squeeze(-1)
-            elif mode == "two":
-                logits_val = model(X_action_A[val_idx], X_action_B[val_idx]).squeeze(-1)
-            else:
-                logits_val = model(
-                    X_action_coords[val_idx],
-                    X_action_delta[val_idx],
-                    X_action_bone[val_idx],
-                    X_action_bone_delta[val_idx],
-                ).squeeze(-1)
-        mask_val = mask[val_idx]
-        if mask_val.sum().item() == 0:
-            continue
-        probs = torch.sigmoid(logits_val).cpu().numpy()
-        y_val = y_action[val_idx].cpu().numpy()
-        valid = mask_val.cpu().numpy()
-        probs = probs[valid]
-        y_val = y_val[valid]
-        thresh = getattr(config, "decision_threshold", 0.5)
-        preds = (probs > thresh).astype(int)
-        if (preds.sum() + y_val.sum()) == 0:
-            f1 = 0.0
-        else:
-            tp = ((preds == 1) & (y_val == 1)).sum()
-            fp = ((preds == 1) & (y_val == 0)).sum()
-            fn = ((preds == 0) & (y_val == 1)).sum()
-            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-            if precision + recall == 0:
-                f1 = 0.0
-            else:
-                f1 = 2 * precision * recall / (precision + recall)
-        f1_scores.append(f1)
-
-    if len(f1_scores) == 0:
+        x_len = min(len(data[0]), len(data[1]), len(data[2]), len(data[3]))
+    n_samples = min(y_all.shape[0], x_len)
+    if n_samples <= 1:
         return 0.0
-    return float(sum(f1_scores) / len(f1_scores))
+    y_all = y_all[:n_samples]
+
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n_samples)
+    split_idx = max(1, int(0.8 * n_samples))
+    if split_idx >= n_samples:
+        split_idx = n_samples - 1
+    train_idx = perm[:split_idx]
+    val_idx = perm[split_idx:]
+
+    temporal_kernel = getattr(config, "temporal_kernel_size", 9)
+    use_ctr = getattr(config, "use_ctr", True)
+    use_edge_importance = getattr(config, "use_edge_importance", True)
+    num_actions = y_all.shape[2]
+    if mode == "one":
+        model = CTRGCNBackbone(
+            in_channels=config.in_channels_single_stream,
+            num_classes=num_actions,
+            adjacency=adjacency,
+            channels=[base_channels] * num_blocks,
+            dropout=dropout,
+            temporal_kernel=temporal_kernel,
+            use_ctr=use_ctr,
+            use_edge_importance=use_edge_importance,
+        ).to(device)
+    elif mode == "two":
+        model = CTRGCNTwoStream(
+            adjacency=adjacency,
+            num_classes=num_actions,
+            in_channels_coords=config.in_channels_streamA,
+            in_channels_delta=config.in_channels_streamB,
+            base_channels=base_channels,
+            num_blocks=num_blocks,
+            dropout=dropout,
+            temporal_kernel=temporal_kernel,
+            use_ctr=use_ctr,
+            use_edge_importance=use_edge_importance,
+        ).to(device)
+    else:
+        model = CTRGCNFourStream(
+            adjacency=adjacency,
+            num_classes=num_actions,
+            base_channels=base_channels,
+            dropout=dropout,
+            num_blocks=num_blocks,
+            temporal_kernel=temporal_kernel,
+            use_ctr=use_ctr,
+            use_edge_importance=use_edge_importance,
+        ).to(device)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=lr,
+        weight_decay=getattr(config, "weight_decay", 1e-4),
+    )
+    total_steps = epochs * math.ceil(n_samples / batch_size)
+    warmup_steps = max(10, int(0.1 * total_steps))
+    scheduler = WarmupCosineSchedule(
+        optimizer,
+        warmup_steps=warmup_steps,
+        total_steps=total_steps,
+        eta_min=1e-5,
+    )
+    criterion = torch.nn.BCEWithLogitsLoss()
+
+    for _ in range(epochs):
+        model.train()
+        np.random.shuffle(train_idx)
+        for start in range(0, len(train_idx), batch_size):
+            end = min(start + batch_size, len(train_idx))
+            batch_ids = train_idx[start:end]
+            batch_y = y_all[batch_ids]
+            if mode == "one":
+                logits = model(X[batch_ids])
+            elif mode == "two":
+                logits = model(X_streamA[batch_ids], X_streamB[batch_ids])
+            else:
+                logits = model(
+                    X_coords[batch_ids],
+                    X_delta[batch_ids],
+                    X_bone[batch_ids],
+                    X_bone_delta[batch_ids],
+                )
+            optimizer.zero_grad()
+            loss = criterion(logits, batch_y)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=getattr(config, "grad_clip", 1.0))
+            optimizer.step()
+            scheduler.step()
+
+    model.eval()
+    with torch.no_grad():
+        if mode == "one":
+            logits_val = model(X[val_idx])
+        elif mode == "two":
+            logits_val = model(X_streamA[val_idx], X_streamB[val_idx])
+        else:
+            logits_val = model(
+                X_coords[val_idx],
+                X_delta[val_idx],
+                X_bone[val_idx],
+                X_bone_delta[val_idx],
+            )
+    probs = torch.sigmoid(logits_val).cpu().numpy()
+    y_val = y_all[val_idx].cpu().numpy()
+    thresh = getattr(config, "decision_threshold", 0.5)
+    preds = (probs > thresh).astype(int)
+    tp = ((preds == 1) & (y_val == 1)).sum()
+    fp = ((preds == 1) & (y_val == 0)).sum()
+    fn = ((preds == 0) & (y_val == 1)).sum()
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    if precision + recall == 0:
+        return 0.0
+    return float(2 * precision * recall / (precision + recall))
 
 
 def train_ctr_gcn_models(batches, ordered_joints, adjacency, config: CTRGCNConfig, device: str | None = None):
     # Device resolution
     if device is None:
         device = config.device
-
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
-
     if device == "cuda" and not torch.cuda.is_available():
         device = "cpu"
-
     print(f"Training CTR-GCN using device: {device}")
 
-    model_dict_single: dict[str, nn.Module] = {}
-    model_dict_pair: dict[str, nn.Module] = {}
+    model_dict_single: dict[str, Any] = {}
+    model_dict_pair: dict[str, Any] = {}
 
     data_dict = collect_ctr_gcn_windows(batches, ordered_joints, config)
     windows_single = data_dict["windows_single"]
     windows_pair = data_dict["windows_pair"]
     labels_single = data_dict["labels"]["single"]
     labels_pair = data_dict["labels"]["pair"]
+    actions_single = data_dict["actions"]["single"]
+    actions_pair = data_dict["actions"]["pair"]
+
     base_channels = getattr(config, "base_channels", 64)
     num_blocks = getattr(config, "num_blocks", 3)
     dropout = getattr(config, "dropout", 0.1)
     lr = getattr(config, "lr", 1e-3)
-    alpha_balance = getattr(config, "alpha_balance", None)
+    batch_size = getattr(config, "batch_size", 16)
+    epochs = getattr(config, "epochs", 2)
+    temporal_kernel = getattr(config, "temporal_kernel_size", 9)
+    use_ctr = getattr(config, "use_ctr", True)
+    use_edge_importance = getattr(config, "use_edge_importance", True)
 
-    for switch_name, streams_tuple, y_dict in [
-        ("single", windows_single, labels_single),
-        ("pair", windows_pair, labels_pair),
+    for switch_name, streams_tuple, labels_tensor, actions_list in [
+        ("single", windows_single, labels_single, actions_single),
+        ("pair", windows_pair, labels_pair, actions_pair),
     ]:
         mode, data = streams_tuple
-        if mode == "one" and (data is None or data.shape[0] == 0):
-            continue
-        if mode in ("two", "four") and (not data or (isinstance(data, tuple) and len(data[0]) == 0)):
+        num_actions = len(actions_list)
+        if num_actions == 0:
             continue
 
         if mode == "one":
+            if data is None or data.shape[0] == 0:
+                continue
             X = data.to(device)
+            x_len = X.shape[0]
         elif mode == "two":
+            if not data or len(data[0]) == 0:
+                continue
             X_streamA = torch.stack(data[0], dim=0).to(device)
             X_streamB = torch.stack(data[1], dim=0).to(device)
+            x_len = min(len(data[0]), len(data[1]))
         else:
+            if not data or len(data[0]) == 0:
+                continue
             X_coords = torch.stack(data[0], dim=0).to(device)
             X_delta = torch.stack(data[1], dim=0).to(device)
             X_bone = torch.stack(data[2], dim=0).to(device)
             X_bone_delta = torch.stack(data[3], dim=0).to(device)
-        if verbose:
-            if mode == "one":
-                print(f"[train_ctr_gcn_models] switch={switch_name} X shape {X.shape}")
-            elif mode == "two":
-                print(f"[train_ctr_gcn_models] switch={switch_name} streamA {X_streamA.shape}, streamB {X_streamB.shape}")
-            else:
-                print(f"[train_ctr_gcn_models] switch={switch_name} coords {X_coords.shape}, delta {X_delta.shape}, bone {X_bone.shape}, bone_delta {X_bone_delta.shape}")
+            x_len = min(len(data[0]), len(data[1]), len(data[2]), len(data[3]))
 
-        batch_size = 16
-        if config.mode == "dev":
-            epochs = 1
-        elif config.mode == "validate":
-            epochs = 3
-        else:
-            epochs = 5
+        y_tensor = labels_tensor.to(device)  # (N, T, num_actions)
+        n_samples = min(y_tensor.shape[0], x_len)
+        if n_samples == 0:
+            continue
+        y_tensor = y_tensor[:n_samples]
 
-        # Choose adjacency based on switch (single vs pair)
         adjacency_local = adjacency if switch_name == "single" else make_pair_adjacency(adjacency)
+        if mode == "one":
+            model = CTRGCNBackbone(
+                in_channels=config.in_channels_single_stream,
+                num_classes=num_actions,
+                adjacency=adjacency_local,
+                channels=[base_channels] * num_blocks,
+                dropout=dropout,
+                temporal_kernel=temporal_kernel,
+                use_ctr=use_ctr,
+                use_edge_importance=use_edge_importance,
+            ).to(device)
+        elif mode == "two":
+            model = CTRGCNTwoStream(
+                adjacency=adjacency_local,
+                num_classes=num_actions,
+                in_channels_coords=config.in_channels_streamA,
+                in_channels_delta=config.in_channels_streamB,
+                base_channels=base_channels,
+                num_blocks=num_blocks,
+                dropout=dropout,
+                temporal_kernel=temporal_kernel,
+                use_ctr=use_ctr,
+                use_edge_importance=use_edge_importance,
+            ).to(device)
+        else:
+            model = CTRGCNFourStream(
+                adjacency=adjacency_local,
+                num_classes=num_actions,
+                base_channels=base_channels,
+                dropout=dropout,
+                num_blocks=num_blocks,
+                temporal_kernel=temporal_kernel,
+                use_ctr=use_ctr,
+                use_edge_importance=use_edge_importance,
+            ).to(device)
 
-        for action, labels in y_dict.items():
-            labels_np = np.asarray(labels, dtype=np.float32)   # (N, T)
-            y_tensor = torch.from_numpy(labels_np).to(device)  # (N, T)
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=lr,
+            weight_decay=getattr(config, "weight_decay", 1e-4)
+        )
+        total_steps = epochs * math.ceil(n_samples / batch_size)
+        warmup_steps = max(10, int(0.1 * total_steps))
+        scheduler = WarmupCosineSchedule(
+            optimizer,
+            warmup_steps=warmup_steps,
+            total_steps=total_steps,
+            eta_min=1e-5
+        )
+        criterion = torch.nn.BCEWithLogitsLoss()
 
-            mask = ~torch.isnan(y_tensor)
-            if mask.sum().item() == 0:
-                continue
-            y_action = y_tensor
-
-            total_pos = torch.nan_to_num(y_action, nan=0.0).sum().item()
-            if verbose:
-                print(f"[train] action={action}, windows={y_action.shape[0]}, frames={y_action.shape[1]}, positives={total_pos}")
-
-
-
-            if mode == "one":
-                X_action = X
-                x_len = X_action.shape[0]
-                model =CTRGCNMedium(
-                    in_channels=config.in_channels_single_stream,
-                    num_classes=1,
-                    adjacency=adjacency_local,
-                    dropout=dropout,
-                ).to(device)
-            elif mode == "two":
-                X_action_A = X_streamA
-                X_action_B = X_streamB
-                x_len = min(X_action_A.shape[0], X_action_B.shape[0])
-                model = CTRGCNTwoStream(
-                    adjacency=adjacency_local,
-                    in_channels_coords=config.in_channels_streamA,
-                    in_channels_delta=config.in_channels_streamB,
-                    base_channels=base_channels,
-                    num_blocks=num_blocks,
-                    dropout=dropout,
-                ).to(device)
-            else:
-                    X_action_coords = X_coords
-                    X_action_delta = X_delta
-                    X_action_bone = X_bone
-                    X_action_bone_delta = X_bone_delta
-                    x_len = min(
-                    X_action_coords.shape[0],
-                    X_action_delta.shape[0],
-                    X_action_bone.shape[0],
-                    X_action_bone_delta.shape[0],
+        train_idx = np.arange(n_samples)
+        for _ in range(epochs):
+            model.train()
+            np.random.shuffle(train_idx)
+            for start in range(0, n_samples, batch_size):
+                end = min(start + batch_size, n_samples)
+                batch_ids = train_idx[start:end]
+                batch_y = y_tensor[batch_ids]
+                if mode == "one":
+                    logits = model(X[batch_ids])
+                elif mode == "two":
+                    logits = model(X_streamA[batch_ids], X_streamB[batch_ids])
+                else:
+                    logits = model(
+                        X_coords[batch_ids],
+                        X_delta[batch_ids],
+                        X_bone[batch_ids],
+                        X_bone_delta[batch_ids],
                     )
-                    model = CTRGCNFourStream(
-                        adjacency=adjacency_local,
-                        base_channels=base_channels,
-                        dropout=dropout,
-                        num_blocks=num_blocks,
-                    ).to(device)
+                optimizer.zero_grad()
+                loss = criterion(logits, batch_y)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=getattr(config, "grad_clip", 1.0))
+                optimizer.step()
+                scheduler.step()
 
-            optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-            if alpha_balance is not None:
-                pos_weight = torch.tensor([alpha_balance], device=device)
-                criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-            else:
-                criterion = torch.nn.BCEWithLogitsLoss()
-
-            # Align sample counts between labels and windows
-            n_samples = min(y_action.shape[0], x_len)
-            if n_samples == 0:
-                continue
-            if n_samples != y_action.shape[0] and verbose:
-                print(f"[train_ctr_gcn_models] Mismatch between labels ({y_action.shape[0]}) and windows ({x_len}) for action {action}; using {n_samples}")
-            y_action = y_action[:n_samples]
-            mask = mask[:n_samples]
-
-            for _ in range(epochs):
-                model.train()
-                for start in range(0, n_samples, batch_size):
-                    end = min(start + batch_size, n_samples)
-                    batch_y = y_action[start:end]
-                    batch_mask = mask[start:end]
-                    if mode == "one":
-                        logits = model(X_action[start:end]).squeeze(-1)
-                    elif mode == "two":
-                        logits = model(X_action_A[start:end], X_action_B[start:end]).squeeze(-1)
-                    else:
-                        logits = model(
-                            X_action_coords[start:end],
-                            X_action_delta[start:end],
-                            X_action_bone[start:end],
-                            X_action_bone_delta[start:end],
-                        ).squeeze(-1)
-                    if batch_mask.sum().item() == 0:
-                        continue
-                    logits = logits[batch_mask]
-                    batch_y_masked = batch_y[batch_mask]
-                    optimizer.zero_grad()
-                    loss = criterion(logits, batch_y_masked)
-                    loss.backward()
-                    optimizer.step()
-
-            if switch_name == "single":
-                model_dict_single[action] = model
-            else:
-                model_dict_pair[action] = model
+        if switch_name == "single":
+            model_dict_single["model"] = model
+            model_dict_single["actions"] = actions_list
+        else:
+            model_dict_pair["model"] = model
+            model_dict_pair["actions"] = actions_list
 
     return {"single": model_dict_single, "pair": model_dict_pair}
 
-
-# ======================
-# MULTICLASS PREDICTION (FRAME->EVENT)
-# ======================
-def predict_multiclass(pred, meta, threshold: float = 0.27):
+def predict_multiclass(pred, meta, threshold: float = CTRGCNConfig.decision_threshold):
     ama = np.argmax(pred, axis=1)
     ama = np.where(pred.max(axis=1) >= threshold, ama, -1)
     ama = pd.Series(ama, index=meta.video_frame)
@@ -1253,14 +1268,14 @@ def predict_multiclass(pred, meta, threshold: float = 0.27):
             submission_part.iat[i, submission_part.columns.get_loc("stop_frame")] = new_stop_frame
     assert (submission_part.stop_frame > submission_part.start_frame).all(), "stop <= start"
     if verbose:
-        print("  actions found:", len(submission_part))
+        print("  number of action sequences predicted:", len(submission_part))
     return submission_part
 
 
 # ======================
 # MODEL LOADING / INFERENCE
 # ======================
-def load_ctr_gcn_models(model_dir: str | None, actions: list[str], adjacency: np.ndarray, config: CTRGCNConfig, device: str | None = None, bp_slug: str | None = None, switch_tr: str = "single") -> dict[str, nn.Module]:
+def load_ctr_gcn_models(model_dir: str | None, actions: list[str], adjacency: np.ndarray, config: CTRGCNConfig, device: str | None = None, bp_slug: str | None = None, switch_tr: str = "single") -> dict[str, Any]:
     # Device resolution
     if device is None:
         device = config.device
@@ -1273,7 +1288,7 @@ def load_ctr_gcn_models(model_dir: str | None, actions: list[str], adjacency: np
 
     print(f"Loading CTR-GCN using device: {device}")
 
-    model_dict: dict[str, nn.Module] = {}
+    model_dict: dict[str, Any] = {}
 
     best_params = load_best_params_csv_for_config(config, bp_slug=bp_slug)
     if best_params is not None:
@@ -1286,43 +1301,70 @@ def load_ctr_gcn_models(model_dir: str | None, actions: list[str], adjacency: np
     num_blocks = getattr(config, "num_blocks", 3)
     dropout = getattr(config, "dropout", 0.1)
     adjacency_local = adjacency if switch_tr == "single" else make_pair_adjacency(adjacency)
-    base_dir = get_stream_model_dir(config, bp_slug=bp_slug)
+    base_dir = model_dir if model_dir is not None else get_stream_model_dir(config, bp_slug=bp_slug)
     model_dir = os.path.join(base_dir, switch_tr)
     os.makedirs(model_dir, exist_ok=True)
+    actions_path = os.path.join(model_dir, f"{switch_tr}_actions.json")
+    if os.path.exists(actions_path):
+        try:
+            actions = json.loads(Path(actions_path).read_text())
+        except Exception:
+            pass
+    num_actions = len(actions)
 
-    for action in actions:
-        if mode == "one":
-            model = CTRGCNMedium(
-                in_channels=config.in_channels_single_stream,
-                num_classes=1,
-                adjacency=adjacency_local,
-                dropout=dropout,
-            )
-        elif mode == "two":
-            model = CTRGCNTwoStream(
-                adjacency=adjacency_local,
-                in_channels_coords=config.in_channels_streamA,
-                in_channels_delta=config.in_channels_streamB,
-                base_channels=base_channels,
-                num_blocks=num_blocks,
-                dropout=dropout,
-            )
-        elif mode == "four":
-            model = CTRGCNFourStream(adjacency=adjacency_local, base_channels=base_channels, dropout=dropout, num_blocks=num_blocks)
-        else:
-            raise ValueError(f"Unsupported stream_mode: {mode}")
+    temporal_kernel = getattr(config, "temporal_kernel_size", 9)
+    use_ctr = getattr(config, "use_ctr", True)
+    use_edge_importance = getattr(config, "use_edge_importance", True)
+    if mode == "one":
+        model = CTRGCNBackbone(
+            in_channels=config.in_channels_single_stream,
+            num_classes=num_actions,
+            adjacency=adjacency_local,
+            channels=[base_channels] * num_blocks,
+            dropout=dropout,
+            temporal_kernel=temporal_kernel,
+            use_ctr=use_ctr,
+            use_edge_importance=use_edge_importance,
+        )
+    elif mode == "two":
+        model = CTRGCNTwoStream(
+            adjacency=adjacency_local,
+            num_classes=num_actions,
+            in_channels_coords=config.in_channels_streamA,
+            in_channels_delta=config.in_channels_streamB,
+            base_channels=base_channels,
+            num_blocks=num_blocks,
+            dropout=dropout,
+            temporal_kernel=temporal_kernel,
+            use_ctr=use_ctr,
+            use_edge_importance=use_edge_importance,
+        )
+    elif mode == "four":
+        model = CTRGCNFourStream(
+            adjacency=adjacency_local,
+            num_classes=num_actions,
+            base_channels=base_channels,
+            dropout=dropout,
+            num_blocks=num_blocks,
+            temporal_kernel=temporal_kernel,
+            use_ctr=use_ctr,
+            use_edge_importance=use_edge_importance,
+        )
+    else:
+        raise ValueError(f"Unsupported stream_mode: {mode}")
 
-        weight_path = os.path.join(model_dir, f"{action}.pt")
-        state = torch.load(weight_path, map_location=device)
-        model.load_state_dict(state)
-        model.to(device)
-        model.eval()
-        model_dict[action] = model
+    weight_path = os.path.join(model_dir, f"{switch_tr}.pt")
+    state = torch.load(weight_path, map_location=device)
+    model.load_state_dict(state)
+    model.to(device)
+    model.eval()
+    model_dict["model"] = model
+    model_dict["actions"] = actions
 
     return model_dict
 
 
-def submit_ctr_gcn(body_parts_tracked_str: str, switch_tr: str, model_dict: dict[str, nn.Module], config: CTRGCNConfig, device: str | None = None, bp_slug: str | None = None) -> pd.DataFrame:
+def submit_ctr_gcn(body_parts_tracked_str: str, switch_tr: str, model_dict: dict[str, Any], config: CTRGCNConfig, device: str | None = None, bp_slug: str | None = None) -> pd.DataFrame:
     # Device resolution
     if device is None:
         device = config.device
@@ -1353,10 +1395,12 @@ def submit_ctr_gcn(body_parts_tracked_str: str, switch_tr: str, model_dict: dict
     mode = getattr(config, "stream_mode", "one")
 
     submissions = []
+    model = model_dict.get("model")
+    model_actions = model_dict.get("actions", [])
     for switch_te, data_te, meta_te, actions_te in generator:
-        if switch_te != switch_tr:
+        if switch_te != switch_tr or model is None:
             continue
-        actions_available = [a for a in actions_te if a in model_dict]
+        actions_available = [a for a in model_actions if a in actions_te]
         if not actions_available:
             continue
 
@@ -1393,32 +1437,51 @@ def submit_ctr_gcn(body_parts_tracked_str: str, switch_tr: str, model_dict: dict
         sum_probs = np.zeros((n_frames, n_actions), dtype=np.float32)
         counts = np.zeros((n_frames, n_actions), dtype=np.float32)
 
-        for action_idx, action_name in enumerate(actions_available):
-            model = model_dict[action_name]
-            with torch.no_grad():
-                if mode == "one":
-                    logits = model(X).squeeze(-1)
-                elif mode == "two":
-                    logits = model(X_streamA, X_streamB).squeeze(-1)
-                else:
-                    logits = model(X_coords, X_delta, X_bone, X_bone_delta).squeeze(-1)
-            probs = torch.sigmoid(logits).cpu().numpy()  # (N, T)
-            for w_idx, frames in enumerate(frame_ranges):
-                for t, f in enumerate(frames):
-                    fi = frame_to_idx.get(f)
-                    if fi is None or t >= probs.shape[1]:
-                        continue
-                    p = float(probs[w_idx, t])
-                    sum_probs[fi, action_idx] += p
-                    counts[fi, action_idx] += 1.0
+        # model forward once
+        with torch.no_grad():
+            if mode == "one":
+                logits = model(X)
+            elif mode == "two":
+                logits = model(X_streamA, X_streamB)
+            else:
+                logits = model(X_coords, X_delta, X_bone, X_bone_delta)
+        probs_full = torch.sigmoid(logits).cpu().numpy()  # (N, T, num_actions_full)
+        action_indices = [model_actions.index(a) for a in actions_available]
+        for w_idx, frames in enumerate(frame_ranges):
+            for t, f in enumerate(frames):
+                fi = frame_to_idx.get(f)
+                if fi is None or t >= probs_full.shape[1]:
+                    continue
+                for out_idx, act_idx in enumerate(action_indices):
+                    p = float(probs_full[w_idx, t, act_idx])
+                    sum_probs[fi, out_idx] += p
+                    counts[fi, out_idx] += 1.0
 
         counts[counts == 0] = 1.0
         pred_array = sum_probs / counts
         pred_array = median_filter(pred_array, size=(5, 1))
         pred_df = pd.DataFrame(pred_array, index=meta_te.video_frame, columns=actions_available)
         thresh = getattr(config, "decision_threshold", 0.27)
-        submission_part = predict_multiclass(pred_df, meta_te, threshold=thresh)
-        submissions.append(submission_part)
+        # Build submission per action (multi-label)
+        parts = []
+        for action_name in actions_available:
+            mask = pred_df[action_name].values > thresh
+            changes = np.diff(np.concatenate(([0], mask.astype(int), [0])))
+            starts = np.where(changes == 1)[0]
+            ends = np.where(changes == -1)[0]
+            for s, e in zip(starts, ends):
+                parts.append(
+                    {
+                        "video_id": meta_te.video_id.iloc[0],
+                        "agent_id": meta_te.agent_id.iloc[0],
+                        "target_id": meta_te.target_id.iloc[0],
+                        "action": action_name,
+                        "start_frame": meta_te.video_frame.iloc[s],
+                        "stop_frame": meta_te.video_frame.iloc[e - 1] + 1,
+                    }
+                )
+        if parts:
+            submissions.append(pd.DataFrame(parts))
 
     if len(submissions) == 0:
         return pd.DataFrame(columns=["video_id", "agent_id", "target_id", "action", "start_frame", "stop_frame"])
@@ -1432,7 +1495,7 @@ train = pd.read_csv(cwd / "Data" / "train.csv")
 train["n_mice"] = 4 - train[["mouse1_strain", "mouse2_strain", "mouse3_strain", "mouse4_strain"]].isna().sum(axis=1)
 train_without_mabe22 = train.query("~ lab_id.str.startswith('MABe22_')")
 test = pd.read_csv(cwd / "Data" / "test.csv")
-body_parts_tracked_list = sorted(train.body_parts_tracked.unique())
+body_parts_tracked_list = sorted(train_without_mabe22.body_parts_tracked.unique())
 
 if RUN_MODE == "tune":
     print("Running CTR-GCN random-search hyperparameter tuning...")
@@ -1453,7 +1516,7 @@ if RUN_MODE == "tune":
         results_path = os.path.join("tuning_results", f"tuning_results_{stream_mode}_{bp_slug}.csv")
         with open(results_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["trial", "window", "stride", "base_channels", "num_blocks", "dropout", "lr", "alpha_balance", "decision_threshold", "mean_f1", "timestamp"])
+            writer.writerow(["trial", "window", "stride", "base_channels", "num_blocks", "dropout", "lr", "momentum", "weight_decay", "batch_size", "epochs", "temporal_kernel_size", "alpha_balance", "decision_threshold", "mean_f1", "timestamp"])
 
         best_f1 = -1
         best_params = None
@@ -1465,6 +1528,11 @@ if RUN_MODE == "tune":
             num_blocks = random.choice(param_space["num_blocks"])
             dropout = random.choice(param_space["dropout"])
             lr = random.choice(param_space["learning_rate"])
+            momentum = random.choice(param_space.get("momentum", [0.9]))
+            weight_decay = random.choice(param_space.get("weight_decay", [1e-4]))
+            batch_size = random.choice(param_space.get("batch_size", [64]))
+            epochs = random.choice(param_space.get("epochs", [120]))
+            temporal_kernel = random.choice(param_space.get("temporal_kernel_size", [9]))
             alpha_balance = random.choice(param_space["alpha_class_balance"])
             decision_threshold = random.choice(param_space["decision_threshold"])
 
@@ -1475,6 +1543,11 @@ if RUN_MODE == "tune":
             cfg.num_blocks = num_blocks
             cfg.dropout = dropout
             cfg.lr = lr
+            cfg.momentum = momentum
+            cfg.weight_decay = weight_decay
+            cfg.batch_size = batch_size
+            cfg.epochs = epochs
+            cfg.temporal_kernel_size = temporal_kernel
             cfg.alpha_balance = alpha_balance
             cfg.decision_threshold = decision_threshold
             cfg.max_batches = None
@@ -1491,7 +1564,7 @@ if RUN_MODE == "tune":
 
             with open(results_path, "a", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow([trial, window, stride, base_channels, num_blocks, dropout, lr, alpha_balance, decision_threshold, mean_f1, time.time()])
+                writer.writerow([trial, window, stride, base_channels, num_blocks, dropout, lr, momentum, weight_decay, batch_size, epochs, temporal_kernel, alpha_balance, decision_threshold, mean_f1, time.time()])
 
             if mean_f1 > best_f1:
                 best_f1 = mean_f1
@@ -1508,14 +1581,16 @@ if RUN_MODE == "tune":
                 }
                 model_dir = get_stream_model_dir(cfg, bp_slug=bp_slug)
                 best_model_dict_all = train_ctr_gcn_models(batches, ordered_joints, adjacency, cfg, device=device)
-                for action, model in best_model_dict_all["single"].items():
-                    path_single = os.path.join(model_dir, "single")
-                    os.makedirs(path_single, exist_ok=True)
-                    torch.save(model.state_dict(), os.path.join(path_single, f"{action}.pt"))
-                for action, model in best_model_dict_all["pair"].items():
-                    path_pair = os.path.join(model_dir, "pair")
-                    os.makedirs(path_pair, exist_ok=True)
-                    torch.save(model.state_dict(), os.path.join(path_pair, f"{action}.pt"))
+                path_single = os.path.join(model_dir, "single")
+                path_pair = os.path.join(model_dir, "pair")
+                os.makedirs(path_single, exist_ok=True)
+                os.makedirs(path_pair, exist_ok=True)
+                if best_model_dict_all["single"]:
+                    torch.save(best_model_dict_all["single"]["model"].state_dict(), os.path.join(path_single, "single.pt"))
+                    Path(os.path.join(path_single, "single_actions.json")).write_text(json.dumps(best_model_dict_all["single"]["actions"]))
+                if best_model_dict_all["pair"]:
+                    torch.save(best_model_dict_all["pair"]["model"].state_dict(), os.path.join(path_pair, "pair.pt"))
+                    Path(os.path.join(path_pair, "pair_actions.json")).write_text(json.dumps(best_model_dict_all["pair"]["actions"]))
 
         print("\n==== Hyperparameter Tuning Complete for", bp_slug, "====")
         if best_params is not None:
@@ -1543,20 +1618,25 @@ if RUN_MODE == "tune_grid":
                 param_space["num_blocks"],
                 param_space["dropout"],
                 param_space["learning_rate"],
+                param_space.get("momentum", [0.9]),
+                param_space.get("weight_decay", [1e-4]),
+                param_space.get("batch_size", [64]),
+                param_space.get("epochs", [120]),
                 param_space["alpha_class_balance"],
                 param_space["decision_threshold"],
+                param_space.get("temporal_kernel_size", [9]),
             )
         )
         tag = stream_mode
         grid_results_path = os.path.join("grid_results", f"grid_results_{tag}_{bp_slug}.csv")
         with open(grid_results_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["idx", "window", "stride", "base_channels", "num_blocks", "dropout", "lr", "alpha_balance", "decision_threshold", "mean_f1"])
+            writer.writerow(["idx", "window", "stride", "base_channels", "num_blocks", "dropout", "lr", "momentum", "weight_decay", "batch_size", "epochs", "alpha_balance", "decision_threshold", "temporal_kernel_size", "mean_f1"])
 
         best_f1 = -1.0
         best_params = None
         for idx, combo in enumerate(grid, start=1):
-            window, stride, base_channels, num_blocks, dropout, lr, alpha_balance, decision_threshold = combo
+            window, stride, base_channels, num_blocks, dropout, lr, momentum, weight_decay, batch_size, epochs, alpha_balance, decision_threshold, temporal_kernel = combo
             cfg = CTRGCNConfig(mode="validate", max_videos=None, use_delta=True, use_bone=True, use_bone_delta=True, stream_mode=stream_mode)
             cfg.window = window
             cfg.stride = stride
@@ -1564,6 +1644,11 @@ if RUN_MODE == "tune_grid":
             cfg.num_blocks = num_blocks
             cfg.dropout = dropout
             cfg.lr = lr
+            cfg.momentum = momentum
+            cfg.weight_decay = weight_decay
+            cfg.batch_size = batch_size
+            cfg.epochs = epochs
+            cfg.temporal_kernel_size = temporal_kernel
             cfg.alpha_balance = alpha_balance
             cfg.decision_threshold = decision_threshold
             cfg.max_batches = None
@@ -1580,7 +1665,7 @@ if RUN_MODE == "tune_grid":
 
             with open(grid_results_path, "a", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow([idx, window, stride, base_channels, num_blocks, dropout, lr, alpha_balance, decision_threshold, mean_f1])
+                writer.writerow([idx, window, stride, base_channels, num_blocks, dropout, lr, momentum, weight_decay, batch_size, epochs, alpha_balance, decision_threshold, temporal_kernel, mean_f1])
 
             if mean_f1 > best_f1:
                 best_f1 = mean_f1
@@ -1598,14 +1683,16 @@ if RUN_MODE == "tune_grid":
 
             model_dict_all = train_ctr_gcn_models(batches, ordered_joints, adjacency, cfg, device=device)
             model_dir = get_stream_model_dir(cfg, bp_slug=bp_slug)
-            for action, model in model_dict_all["single"].items():
-                path_single = os.path.join(model_dir, "single")
-                os.makedirs(path_single, exist_ok=True)
-                torch.save(model.state_dict(), os.path.join(path_single, f"{action}_{idx}.pt"))
-            for action, model in model_dict_all["pair"].items():
-                path_pair = os.path.join(model_dir, "pair")
-                os.makedirs(path_pair, exist_ok=True)
-                torch.save(model.state_dict(), os.path.join(path_pair, f"{action}_{idx}.pt"))
+            path_single = os.path.join(model_dir, "single")
+            path_pair = os.path.join(model_dir, "pair")
+            os.makedirs(path_single, exist_ok=True)
+            os.makedirs(path_pair, exist_ok=True)
+            if model_dict_all["single"]:
+                torch.save(model_dict_all["single"]["model"].state_dict(), os.path.join(path_single, f"single_{idx}.pt"))
+                Path(os.path.join(path_single, f"single_actions_{idx}.json")).write_text(json.dumps(model_dict_all["single"]["actions"]))
+            if model_dict_all["pair"]:
+                torch.save(model_dict_all["pair"]["model"].state_dict(), os.path.join(path_pair, f"pair_{idx}.pt"))
+                Path(os.path.join(path_pair, f"pair_actions_{idx}.json")).write_text(json.dumps(model_dict_all["pair"]["actions"]))
 
         print("\nGrid search completed for", bp_slug)
         if best_params is not None:
@@ -1655,7 +1742,6 @@ if RUN_MODE == "submit":
 #=================================================
 #    Utility functions to aid model evaluation
 #=================================================
-from tqdm import tqdm
 import polars as pl
 
 
@@ -1847,12 +1933,11 @@ if RUN_MODE == "dev":
     print("\n========== DEV MODE SANITY CHECK ==========\n")
     device = torch.device("cuda" if torch.cuda.is_available() else GLOBAL_CONFIG.get("device", "cpu"))
     print(f"Using device for dev check: {device}")
-
     if len(body_parts_tracked_list) == 0:
         print("No body-part sets found for dev check.")
     else:
         total_sets = len(body_parts_tracked_list)
-        dev_f1_scores: list[float] = []
+        dev_f1_df = pd.DataFrame(columns=["F1 Score"])
         for bp_idx, bp_str in enumerate(body_parts_tracked_list):
             bp_slug = slugify_bodyparts(bp_str)
             body_parts_tracked = filter_tracked_body_parts(json.loads(bp_str))
@@ -1875,10 +1960,15 @@ if RUN_MODE == "dev":
                 max_videos=None,  # limit handled by slicing above
                 max_batches=20,
                 max_windows=100,
-                window=30,
-                stride=15,
+                window=70,
+                stride=30,
                 show_progress=True,
-                stream_mode=GLOBAL_CONFIG.get("stream_mode", "one"),
+                stream_mode="four",
+                decision_threshold = 0.3,
+                epochs = 2,
+                batch_size = 7,
+                weight_decay = 0,
+                alpha_balance= 1.6,
             )
 
             # Train models on first 5 videos (single + pair)
@@ -1946,31 +2036,53 @@ if RUN_MODE == "dev":
                 sum_probs = np.zeros((n_frames, n_actions), dtype=np.float32)
                 counts = np.zeros((n_frames, n_actions), dtype=np.float32)
 
-                for action_idx, action_name in enumerate(actions_available):
-                    model = model_dict_all[switch][action_name]
-                    with torch.no_grad():
-                        if mode == "one":
-                            logits = model(X).squeeze(-1)
-                        elif mode == "two":
-                            logits = model(X_streamA, X_streamB).squeeze(-1)
-                        else:
-                            logits = model(X_coords, X_delta, X_bone, X_bone_delta).squeeze(-1)
-                    probs = torch.sigmoid(logits).cpu().numpy()
-                    for w_idx, frames in enumerate(frame_ranges):
-                        for t, f in enumerate(frames):
-                            fi = frame_to_idx.get(f)
-                            if fi is None or t >= probs.shape[1]:
-                                continue
-                            p = float(probs[w_idx, t])
-                            sum_probs[fi, action_idx] += p
-                            counts[fi, action_idx] += 1.0
+                model_switch = model_dict_all.get(switch, {})
+                model_m = model_switch.get("model")
+                actions_model = model_switch.get("actions", [])
+                if model_m is None:
+                    continue
+                action_indices = [actions_model.index(a) for a in actions_available]
+                with torch.no_grad():
+                    if mode == "one":
+                        logits = model_m(X)
+                    elif mode == "two":
+                        logits = model_m(X_streamA, X_streamB)
+                    else:
+                        logits = model_m(X_coords, X_delta, X_bone, X_bone_delta)
+                probs_full = torch.sigmoid(logits).cpu().numpy()
+                for w_idx, frames in enumerate(frame_ranges):
+                    for t, f in enumerate(frames):
+                        fi = frame_to_idx.get(f)
+                        if fi is None or t >= probs_full.shape[1]:
+                            continue
+                        for out_idx, act_idx in enumerate(action_indices):
+                            p = float(probs_full[w_idx, t, act_idx])
+                            sum_probs[fi, out_idx] += p
+                            counts[fi, out_idx] += 1.0
 
                 counts[counts == 0] = 1.0
                 pred_array = sum_probs / counts
                 pred_df = pd.DataFrame(pred_array, index=meta_df.video_frame, columns=actions_available)
                 thresh = getattr(dev_config, "decision_threshold", 0.27)
-                submission_part = predict_multiclass(pred_df, meta_df, threshold=thresh)
-                submissions_local.append(submission_part)
+                parts = []
+                for action_name in actions_available:
+                    mask = pred_df[action_name].values > thresh
+                    changes = np.diff(np.concatenate(([0], mask.astype(int), [0])))
+                    starts = np.where(changes == 1)[0]
+                    ends = np.where(changes == -1)[0]
+                    for s, e in zip(starts, ends):
+                        parts.append(
+                            {
+                                "video_id": meta_df.video_id.iloc[0],
+                                "agent_id": meta_df.agent_id.iloc[0],
+                                "target_id": meta_df.target_id.iloc[0],
+                                "action": action_name,
+                                "start_frame": meta_df.video_frame.iloc[s],
+                                "stop_frame": meta_df.video_frame.iloc[e - 1] + 1,
+                            }
+                        )
+                if parts:
+                    submissions_local.append(pd.DataFrame(parts))
 
             if submissions_local:
                 submission_df = pd.concat(submissions_local, ignore_index=True)
@@ -1989,20 +2101,29 @@ if RUN_MODE == "dev":
             print("\nDEV SUMMARY")
             print(f"Body parts set: {bp_slug}")
             print(f"Train videos: {len(train_vids)}, Test videos: {len(test_vids)}")
-            actions_trained = len(model_dict_all['single']) + len(model_dict_all['pair'])
+            actions_trained = len(model_dict_all.get('single', {}).get('actions', [])) + len(model_dict_all.get('pair', {}).get('actions', []))
             print(f"Actions trained (single+pair): {actions_trained}")
-            print(f"Validation F1 (mouse_fbeta-style): {f1_val:.4f}")
-            dev_f1_scores.append(f1_val)
+            print(f"Validation F1 (mouse_fbeta-style): {f1_val:.4f} \n")
+            dev_f1_df.loc[len(dev_f1_df)] = f1_val
 
-        if dev_f1_scores:
-            overall_f1 = sum(dev_f1_scores) / len(dev_f1_scores)
+
+        if not dev_f1_df.empty:
+            overall_f1 = dev_f1_df["F1 Score"].mean()
             print(f"\n[DEV] Average holdout F1 across body-part sets: {overall_f1:.4f}")
+            csv_path = Path("dev_f1_scores-CTRGCN-testing2.0.csv")
+            dev_f1_df = dev_f1_df.reset_index(drop=True)
+            dev_f1_df.index = range(1, len(dev_f1_df) + 1)
+            dev_f1_df.loc["Overall F1 Score"] = overall_f1
+            # If file exists → load and append
+            if csv_path.exists():
+                existing_df = pd.read_csv(csv_path, index_col=0)
+                combined_df = pd.concat([existing_df, dev_f1_df])
+            else:
+                combined_df = dev_f1_df
 
+            # Save back to CSV
+            combined_df.to_csv(csv_path, index=True)
 
-
-#=========================================
-#       Validate Mode Configs etc.
-#=========================================
 if RUN_MODE == "validate":
     for bp_str in body_parts_tracked_list:
         train_subset = train[train.body_parts_tracked == bp_str]
@@ -2021,53 +2142,30 @@ if RUN_MODE == "validate":
 
         ordered_joints, adjacency = get_ordered_joints_and_adjacency(filter_tracked_body_parts(json.loads(bp_str)))
 
-        # ============================
-        # 80/20 Holdout Evaluation
-        # ============================
-
-        unique_vids = list(train_subset.video_id.unique())
+        # Holdout dev-style evaluation for foresight (5 epochs via submit mode)
+        unique_vids = train_subset.video_id.unique()
         best_holdout_f1 = 0.0
         best_holdout_models = None
-
-        # Need at least 2 videos for a validation split
         if len(unique_vids) >= 2:
-
-            # Shuffle for reproducibility
-            rng = np.random.default_rng(seed=42)
-            rng.shuffle(unique_vids)
-
-            # 80% / 20% split
-            split_idx = max(1, int(len(unique_vids) * 0.8))
-            train_vids = unique_vids[:split_idx]
-            val_vids   = unique_vids[split_idx:]
-
+            # 80/20 split
+            rng = np.random.default_rng(42)
+            perm = rng.permutation(unique_vids)
+            split_idx = max(1, int(0.8 * len(perm)))
+            train_vids = perm[:split_idx]
+            val_vids = perm[split_idx:]
+            if len(val_vids) == 0:  # ensure at least 1 val video
+                val_vids = perm[-1:]
+                train_vids = perm[:-1]
             train_part = train_subset[train_subset.video_id.isin(train_vids)]
-            val_part   = train_subset[train_subset.video_id.isin(val_vids)]
+            val_part = train_subset[train_subset.video_id.isin(val_vids)]
 
-            # Safety check
-            if len(val_vids) == 0:
-                print("[VALIDATE] WARNING: Not enough videos for validation split; skipping.")
-                val_vids = unique_vids[-1:]         # force 1 video into val
-                train_vids = unique_vids[:-1]
-                train_part = train_subset[train_subset.video_id.isin(train_vids)]
-                val_part = train_subset[train_subset.video_id.isin(val_vids)]
-
-            print(f"[SPLIT] Train videos = {len(train_vids)}, Val videos = {len(val_vids)}")
-            print(f"[SPLIT] Train frames = {len(train_part)}, Val frames = {len(val_part)}")
-
-            # -------------------------------
-            # Build evaluation config
-            # -------------------------------
             eval_cfg = CTRGCNConfig(mode="submit", stream_mode=cfg.stream_mode)
             for key, value in (best_params or {}).items():
                 if hasattr(eval_cfg, key):
                     setattr(eval_cfg, key, value)
-            eval_cfg.max_batches = 40
-            eval_cfg.max_windows = 1000
+            eval_cfg.max_batches = None
+            eval_cfg.max_windows = None
 
-            # -------------------------------
-            # Build training batches
-            # -------------------------------
             eval_batches = []
             for switch, data_df, meta_df, label_df in generate_mouse_data(
                 train_part, "train", generate_single=True, generate_pair=True, config=eval_cfg
@@ -2075,133 +2173,129 @@ if RUN_MODE == "validate":
                 eval_batches.append((switch, data_df, meta_df, label_df))
 
             if eval_batches:
-                # ============================
-                # Train models on the 80% train split
-                # ============================
-                model_eval = train_ctr_gcn_models(
-                    eval_batches, ordered_joints, adjacency, eval_cfg,
-                    device=GLOBAL_CONFIG["device"]
-                )
+                model_eval = train_ctr_gcn_models(eval_batches, ordered_joints, adjacency, eval_cfg, device=GLOBAL_CONFIG["device"])
 
-                # ============================
-                # Evaluate on 20% held-out split
-                # ============================
                 submissions_local: list[pd.DataFrame] = []
                 for switch, data_df, meta_df, label_df in generate_mouse_data(
                     val_part, "train", generate_single=True, generate_pair=True, config=eval_cfg
                 ):
-
-                    actions_te = list(label_df.columns)
                     mode = getattr(eval_cfg, "stream_mode", "one")
-
-                    # Prepare inputs (same as original)
+                    actions_model = model_eval[switch]["actions"]
+                    model_m = model_eval[switch]["model"]
                     if mode == "one":
                         window_tensor, frame_ranges = prepare_ctr_gcn_input(data_df, ordered_joints, eval_cfg)
                         if window_tensor.shape[0] == 0:
                             continue
                         X = window_tensor.to(GLOBAL_CONFIG["device"])
-
                     elif mode == "two":
                         streamA_list, streamB_list, frame_ranges = prepare_ctr_gcn_input(data_df, ordered_joints, eval_cfg)
                         if len(streamA_list) == 0:
                             continue
                         X_streamA = torch.stack(streamA_list, dim=0).to(GLOBAL_CONFIG["device"])
                         X_streamB = torch.stack(streamB_list, dim=0).to(GLOBAL_CONFIG["device"])
-
                     else:
                         coords_list, delta_list, bone_list, bone_delta_list, frame_ranges = prepare_ctr_gcn_input(data_df, ordered_joints, eval_cfg)
                         if len(coords_list) == 0:
                             continue
-                        X_coords     = torch.stack(coords_list, dim=0).to(GLOBAL_CONFIG["device"])
-                        X_delta      = torch.stack(delta_list, dim=0).to(GLOBAL_CONFIG["device"])
-                        X_bone       = torch.stack(bone_list, dim=0).to(GLOBAL_CONFIG["device"])
+                        X_coords = torch.stack(coords_list, dim=0).to(GLOBAL_CONFIG["device"])
+                        X_delta = torch.stack(delta_list, dim=0).to(GLOBAL_CONFIG["device"])
+                        X_bone = torch.stack(bone_list, dim=0).to(GLOBAL_CONFIG["device"])
                         X_bone_delta = torch.stack(bone_delta_list, dim=0).to(GLOBAL_CONFIG["device"])
 
-                    # Map frame indices
                     frame_values = meta_df.video_frame.values
                     frame_to_idx = {f: i for i, f in enumerate(frame_values)}
-                    actions_available = [a for a in actions_te if a in model_eval[switch]]
+                    actions_available = [a for a in actions_model if a in label_df.columns]
                     if not actions_available:
                         continue
-
+                    action_indices = [actions_model.index(a) for a in actions_available]
                     sum_probs = np.zeros((len(frame_values), len(actions_available)), dtype=np.float32)
-                    counts    = np.zeros((len(frame_values), len(actions_available)), dtype=np.float32)
+                    counts = np.zeros((len(frame_values), len(actions_available)), dtype=np.float32)
 
-                    for action_idx, action_name in enumerate(actions_available):
-                        model = model_eval[switch][action_name]
-                        with torch.no_grad():
-                            if mode == "one":
-                                logits = model(X).squeeze(-1)
-                            elif mode == "two":
-                                logits = model(X_streamA, X_streamB).squeeze(-1)
-                            else:
-                                logits = model(X_coords, X_delta, X_bone, X_bone_delta).squeeze(-1)
-
-                        probs = torch.sigmoid(logits).cpu().numpy()
-
-                        for w_idx, frames in enumerate(frame_ranges):
-                            for t, f in enumerate(frames):
-                                fi = frame_to_idx.get(f)
-                                if fi is None or t >= probs.shape[1]:
-                                    continue
-                                p = float(probs[w_idx, t])
-                                sum_probs[fi, action_idx] += p
-                                counts[fi, action_idx] += 1.0
+                    with torch.no_grad():
+                        if mode == "one":
+                            logits = model_m(X)
+                        elif mode == "two":
+                            logits = model_m(X_streamA, X_streamB)
+                        else:
+                            logits = model_m(X_coords, X_delta, X_bone, X_bone_delta)
+                    probs_full = torch.sigmoid(logits).cpu().numpy()
+                    for w_idx, frames in enumerate(frame_ranges):
+                        for t, f in enumerate(frames):
+                            fi = frame_to_idx.get(f)
+                            if fi is None or t >= probs_full.shape[1]:
+                                continue
+                            for out_idx, act_idx in enumerate(action_indices):
+                                p = float(probs_full[w_idx, t, act_idx])
+                                sum_probs[fi, out_idx] += p
+                                counts[fi, out_idx] += 1.0
 
                     counts[counts == 0] = 1.0
                     pred_array = sum_probs / counts
-
                     pred_df = pd.DataFrame(pred_array, index=meta_df.video_frame, columns=actions_available)
                     thresh = getattr(eval_cfg, "decision_threshold", 0.27)
+                    parts = []
+                    for action_name in actions_available:
+                        mask = pred_df[action_name].values > thresh
+                        changes = np.diff(np.concatenate(([0], mask.astype(int), [0])))
+                        starts = np.where(changes == 1)[0]
+                        ends = np.where(changes == -1)[0]
+                        for s, e in zip(starts, ends):
+                            parts.append(
+                                {
+                                    "video_id": meta_df.video_id.iloc[0],
+                                    "agent_id": meta_df.agent_id.iloc[0],
+                                    "target_id": meta_df.target_id.iloc[0],
+                                    "action": action_name,
+                                    "start_frame": meta_df.video_frame.iloc[s],
+                                    "stop_frame": meta_df.video_frame.iloc[e - 1] + 1,
+                                }
+                            )
+                    if parts:
+                        submissions_local.append(pd.DataFrame(parts))
 
-                    submission_part = predict_multiclass(pred_df, meta_df, threshold=thresh)
-                    submissions_local.append(submission_part)
-
-                # Combine all predictions
                 if submissions_local:
                     submission_df = pd.concat(submissions_local, ignore_index=True)
                 else:
-                    submission_df = pd.DataFrame(columns=[
-                        "video_id", "agent_id", "target_id",
-                        "action", "start_frame", "stop_frame"
-                    ])
+                    submission_df = pd.DataFrame(columns=["video_id", "agent_id", "target_id", "action", "start_frame", "stop_frame"])
 
                 solution_df = create_solution_df(val_part)
                 if len(submission_df) == 0:
-                    print(f"[VALIDATE] No predicted events on 20% split for {bp_slug}.")
+                    print(f"[VALIDATE] No predicted events on holdout for {bp_slug} - skipping scoring.")
+                else:
+                    holdout_f1 = score(solution_df, submission_df, row_id_column_name="", beta=1)
+                    best_holdout_f1 = holdout_f1
+                    best_holdout_models = model_eval
+                    print(f"[VALIDATE] Holdout F1 for {bp_slug}: {holdout_f1:.4f}")
             else:
-                holdout_f1 = score(solution_df, submission_df, row_id_column_name="", beta=1)
-                best_holdout_f1 = holdout_f1
-                best_holdout_models = model_eval
-                print(f"[VALIDATE] Holdout F1 (20% split) for {bp_slug}: {holdout_f1:.4f}")
-
+                print(f"[VALIDATE] No training batches for holdout split in {bp_slug}.")
         else:
-            print(f"[VALIDATE] Not enough videos for split in {bp_slug}.")
+            print(f"[VALIDATE] Not enough videos for holdout split (found {len(unique_vids)}) for {bp_slug}.")
+
         batches = []
         for switch, data_df, meta_df, label_df in generate_mouse_data(train_subset, "train", generate_single=True, generate_pair=True, config=cfg):
             batches.append((switch, data_df, meta_df, label_df))
 
         model_dict_all = train_ctr_gcn_models(batches, ordered_joints, adjacency, cfg, device=GLOBAL_CONFIG["device"])
         model_dir = get_stream_model_dir(cfg, bp_slug=bp_slug)
-        for action, model in model_dict_all["single"].items():
-            path_single = os.path.join(model_dir, "single")
-            os.makedirs(path_single, exist_ok=True)
-            torch.save(model.state_dict(), os.path.join(path_single, f"{action}.pt"))
-        for action, model in model_dict_all["pair"].items():
-            path_pair = os.path.join(model_dir, "pair")
-            os.makedirs(path_pair, exist_ok=True)
-            torch.save(model.state_dict(), os.path.join(path_pair, f"{action}.pt"))
+        path_single = os.path.join(model_dir, "single")
+        path_pair = os.path.join(model_dir, "pair")
+        os.makedirs(path_single, exist_ok=True)
+        os.makedirs(path_pair, exist_ok=True)
+        if model_dict_all["single"]:
+            torch.save(model_dict_all["single"]["model"].state_dict(), os.path.join(path_single, "single.pt"))
+            Path(os.path.join(path_single, "single_actions.json")).write_text(json.dumps(model_dict_all["single"]["actions"]))
+        if model_dict_all["pair"]:
+            torch.save(model_dict_all["pair"]["model"].state_dict(), os.path.join(path_pair, "pair.pt"))
+            Path(os.path.join(path_pair, "pair_actions.json")).write_text(json.dumps(model_dict_all["pair"]["actions"]))
         print(f"Saved models to {model_dir}")
         if best_holdout_models is not None:
             print(f"[VALIDATE] Best holdout F1 for {bp_slug}: {best_holdout_f1:.4f} (saved _bestdev checkpoints)")
-            for action, model in best_holdout_models["single"].items():
-                path_single = os.path.join(model_dir, "single")
-                os.makedirs(path_single, exist_ok=True)
-                torch.save(model.state_dict(), os.path.join(path_single, f"{action}_bestdev.pt"))
-            for action, model in best_holdout_models["pair"].items():
-                path_pair = os.path.join(model_dir, "pair")
-                os.makedirs(path_pair, exist_ok=True)
-                torch.save(model.state_dict(), os.path.join(path_pair, f"{action}_bestdev.pt"))
+            if best_holdout_models.get("single"):
+                torch.save(best_holdout_models["single"]["model"].state_dict(), os.path.join(path_single, "single_bestdev.pt"))
+                Path(os.path.join(path_single, "single_actions_bestdev.json")).write_text(json.dumps(best_holdout_models["single"]["actions"]))
+            if best_holdout_models.get("pair"):
+                torch.save(best_holdout_models["pair"]["model"].state_dict(), os.path.join(path_pair, "pair_bestdev.pt"))
+                Path(os.path.join(path_pair, "pair_actions_bestdev.json")).write_text(json.dumps(best_holdout_models["pair"]["actions"]))
 
 
 
