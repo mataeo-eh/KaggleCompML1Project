@@ -33,7 +33,7 @@ Our approach evolved from simple baselines to more complex deep learning archite
 We started by analyzing the MABe dataset to understand the structure of the tracking data (keypoints, frames, IDs) and the distribution of the target behavior classes.
 
 ### 2. Baseline Models
-*   **Nearest Neighbors & XGBoost:** A combination of others on Kaggle and ourselves implemented these standard machine learning models to establish a performance baseline and understand the feature importance of the raw tracking data.
+**Nearest Neighbors & XGBoost:** A combination of others on Kaggle and ourselves implemented these standard machine learning models to establish a performance baseline and understand the feature importance of the raw tracking data.
 
 ### 3. Graph Convolutional Networks (GCN)
 Recognizing that the mice can be modeled as "skeletons" (graphs of connected joints), we explored GCNs to capture the spatial relationships between body parts and the temporal dynamics of their movement.
