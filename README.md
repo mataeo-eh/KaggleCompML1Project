@@ -56,7 +56,7 @@ The code is designed to run primarily in a **Kaggle Notebook** environment, wher
 1.  **EDA:** Open `mabe-comp-eda-notebook.ipynb` to view the data analysis.
 2.  **CTR-GCN:** The `CTRGCN-Submission-Notebook-EDU.ipynb` is designed to be run in "dev" mode for testing or "submit" mode for generating predictions. It requires pre-trained model weights (if running inference) or can be adapted for training said weights.
 
-## 📝 Reflection
+## Reflection
 
 This project was a significant learning experience in handling complex, real-world biological data. While we faced challenges in training a highly competitive model due to the complexity of the multi-agent interactions and computational constraints, we gained valuable insights into:
 *   Working with **Graph Neural Networks** for skeletal data.
